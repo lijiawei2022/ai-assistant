@@ -10,9 +10,22 @@ const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'nomic-embed-text';
 const CHUNK_SIZE = 500;
 // RRF标准实现无需阈值，仅按融合分数排序取Top N
-const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按你最初要求）
-const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数
+const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按最初要求）
+const KEYWORD_MIN_MATCH = 2;       // 关键词检索最小匹配数（避免单关键词误匹配）
 const POST_RRF_THRESHOLD = 0.025;  // RRF后置截断阈值（保留弱相关匹配）
+
+// 系统提示（统一常量，确保所有地方一致）
+const CODE_SYSTEM_PROMPT = `【强制规则】你是资深程序员和计算机科学导师。无论用户问什么，必须严格按以下固定结构回答，不得省略任何部分：
+1. 【语法/逻辑分析】先分析代码或问题中的关键点
+2. 【问题定位】明确问题所在（语法错误、逻辑漏洞、性能问题等）
+3. 【解决方案】给出具体修复建议或正确答案
+4. 【代码示例】必要时提供修正后的代码或示例（用代码块包裹）
+5. 【补充知识】简要补充相关知识点（可选）
+
+要求：用简洁的中文回答，避免冗长解释，优先依据知识库内容作答。`;
+
+// 普通问题提示词（不强制格式）
+const GENERAL_SYSTEM_PROMPT = `你是一个专业的编程助手，请用中文简洁回答用户的问题。`;
 
 interface DocChunk {
     fileName: string;
@@ -37,12 +50,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.loadDocumentsWithEmbeddings();
     }
 
-    // 对话历史，初始带系统提示
+    // 对话历史，初始带普通提示词
     private conversationHistory: Array<{
         role: 'system' | 'user' | 'assistant';
         content: string
     }> = [
-        { role: 'system', content: '你是一个专业的编程助手，请用中文简洁回答用户的问题。' }
+        { role: 'system', content: GENERAL_SYSTEM_PROMPT }
     ];
 
     public resolveWebviewView(
@@ -88,13 +101,25 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         );
     }
 
-    // 调用 Ollama 多轮对话接口
-    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
+    // 系统提示（动态选择：代码问题用结构化，普通问题用简洁）
+    private getSystemPrompt(isCodeQuestion: boolean): { role: 'system'; content: string } {
+        return {
+            role: 'system',
+            content: isCodeQuestion ? CODE_SYSTEM_PROMPT : GENERAL_SYSTEM_PROMPT
+        };
+    }
+
+    // 调用 Ollama 多轮对话接口（自动注入系统提示到最前）
+    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>, isCodeQuestion: boolean = false): Promise<string> {
+        // 移除历史中可能存在的旧系统消息，插入最新的系统提示到最前
+        const messagesWithoutSystem = messages.filter(m => m.role !== 'system');
+        const finalMessages = [this.getSystemPrompt(isCodeQuestion), ...messagesWithoutSystem];
+
         return new Promise((resolve) => {
             try {
                 const body = JSON.stringify({
                     model: LLM_MODEL,
-                    messages: messages,
+                    messages: finalMessages,
                     stream: false
                 });
                 
@@ -327,7 +352,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         const fileNames = [...new Set(topResults.map(r => r.chunk.fileName))];
         let contextText = '以下是知识库中相关的内容，请根据这些内容回答问题。\n\n知识库内容：\n';
         for (const result of topResults) {
-            contextText += `\n【文件: ${result.chunk.fileName}】\n${result.chunk.content}\n---\n`;
+            contextText += `\n【文件: ${result.chunk.fileName}】\n\`\`\`\n${result.chunk.content}\n\`\`\`\n---\n`;
         }
 
         console.log(`RAG: Found relevant docs: ${fileNames.join(", ")}`);
@@ -374,41 +399,59 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         try {
             // 检索相关文档
             const ragResult = await this.retrieveRelevantDocs(question);
-            const useRag = ragResult.fileNames.length > 0;
+            const hasRagDocs = ragResult.fileNames.length > 0;
+            console.log(`RAG: hasRagDocs=${hasRagDocs}, files=${ragResult.fileNames.join(",")}`);
             
-            // 构造用户消息内容
-            let userContent = useRag 
-                ? `${ragResult.contextText}\n\n问题：${question}\n\n请根据上面的知识库内容回答，如果知识库中没有相关内容，请直接回答。`
-                : question;
+            // 构造用户消息内容（系统提示已在callOllama中注入，无需重复）
+            let userContent = '';
+
+            if (hasRagDocs) {
+                // 有知识库文档：根据文档+问题+对话历史回答
+                userContent = `${ragResult.contextText}\n用户问题：${question}`;
+            } else {
+                // 无知识库文档：直接根据问题+对话历史回答
+                userContent = `用户问题：${question}`;
+            }
             
-            // 拼接选中的代码上下文（如果有）
+            // 仅当问题涉及代码分析时，才拼接选中代码（避免无关问题携带代码）
+            const codeRelatedKeywords = ['代码', '这段', '本段', '分析', '语法', '错误', '修正', '检查', '这段代码', '语法检查', '本段代码'];
+            
             if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
                 const ctx = AiAssistantViewProvider.selectedCodeContext;
-                userContent += `\n\n参考代码：\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`\n${ctx.code}\n\`\`\``;
+                const isCodeRelated = codeRelatedKeywords.some(kw => question.includes(kw));
+                if (isCodeRelated) {
+                    userContent += `\n\n附：待分析代码\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`${ctx.language}\n${ctx.code}\n\`\`\``;
+                    // 拼接后清空，避免下次无关问题继续携带
+                    AiAssistantViewProvider.selectedCodeContext = null;
+                }
             }
+
+            // 判断是否为代码相关问题
+            const codeKeywords = ['代码', '这段', '本段', '分析', '语法', '错误', '修正', '检查', '语法检查', '本段代码'];
+            const isCodeQuestion = codeKeywords.some(kw => question.includes(kw));
 
             // 用户消息加入历史
             this.conversationHistory.push({ role: 'user', content: userContent });
 
-            // 传入完整历史调用大模型
-            let answer = await this.callOllama(this.conversationHistory);
+            // 传入完整历史调用大模型，根据问题类型选择系统提示
+            const rawAnswer = await this.callOllama(this.conversationHistory, isCodeQuestion);
 
-            // 按用户要求拼接来源说明
-            if (useRag && ragResult.fileNames.length > 0) {
-                // 有匹配文档：将文档+问题+对话历史提交给大模型，根据文档回答
-                answer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}，本地大模型根据相关文档回答`;
+            // 先把大模型原始回答存入历史（不含手动拼接的来源说明，避免历史污染）
+            this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
+
+            // 拼接来源说明，仅用于前端展示，不进历史
+            let finalAnswer = rawAnswer;
+            if (hasRagDocs) {
+                finalAnswer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}，本地大模型根据相关文档回答`;
             } else {
-                // 无匹配文档：大模型直接根据问题和对话历史回答
-                answer += `\n\n知识库中无相关文档，本地大模型直接回答`;
+                finalAnswer += `\n\n知识库中无相关文档，本地大模型直接回答`;
             }
 
-            // 大模型回复加入历史
-            this.conversationHistory.push({ role: 'assistant', content: answer });
-
+            // 发送最终回答给前端
             if (AiAssistantViewProvider.currentPanel) {
                 AiAssistantViewProvider.currentPanel.webview.postMessage({
                     type: 'aiResponse',
-                    response: answer,
+                    response: finalAnswer,
                     hasContext: hasContext
                 });
             }
@@ -439,8 +482,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
     private handleClearChat() {
         AiAssistantViewProvider.selectedCodeContext = null;
-        this.conversationHistory = [ // 重置为仅系统提示
-            { role: 'system', content: '你是一个专业的编程助手，请用中文简洁回答用户的问题。' }
+        this.conversationHistory = [ // 重置为普通提示词
+            { role: 'system', content: GENERAL_SYSTEM_PROMPT }
         ];
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
