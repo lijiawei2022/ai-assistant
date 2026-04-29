@@ -11,21 +11,35 @@ const EMBED_MODEL = 'nomic-embed-text';
 const CHUNK_SIZE = 500;
 // RRF标准实现无需阈值，仅按融合分数排序取Top N
 const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按最初要求）
-const KEYWORD_MIN_MATCH = 2;       // 关键词检索最小匹配数（避免单关键词误匹配）
+const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数（避免单关键词误匹配）
 const POST_RRF_THRESHOLD = 0.025;  // RRF后置截断阈值（保留弱相关匹配）
 
-// 系统提示（统一常量，确保所有地方一致）
-const CODE_SYSTEM_PROMPT = `【强制规则】你是资深程序员和计算机科学导师。无论用户问什么，必须严格按以下固定结构回答，不得省略任何部分：
-1. 【语法/逻辑分析】先分析代码或问题中的关键点
-2. 【问题定位】明确问题所在（语法错误、逻辑漏洞、性能问题等）
-3. 【解决方案】给出具体修复建议或正确答案
-4. 【代码示例】必要时提供修正后的代码或示例（用代码块包裹）
-5. 【补充知识】简要补充相关知识点（可选）
+// 系统设计提示词：面向程序设计领域的AI助教
+const SYSTEM_PROMPT = `你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。
 
-要求：用简洁的中文回答，避免冗长解释，优先依据知识库内容作答。`;
+## 角色定位
+- 资深程序员与计算机科学导师
+- 熟悉C语言等主流编程语言
+- 精通数据结构、算法、软件工程等核心知识
 
-// 普通问题提示词（不强制格式）
-const GENERAL_SYSTEM_PROMPT = `你是一个专业的编程助手，请用中文简洁回答用户的问题。`;
+## 核心能力
+1. **代码分析**：审查代码语法、逻辑、性能问题
+2. **错误诊断**：定位并解释编译错误、运行时错误、逻辑错误
+3. **概念讲解**：清晰解释语法特性、算法原理、设计模式
+4. **调试指导**：提供调试思路、工具和技巧
+5. **最佳实践**：推荐代码规范、优化方案和工程经验
+
+## 回答原则
+- **简洁精准**：直接回答核心问题，避免冗余解释
+- **知识库优先**：优先依据知识库内容作答，知识库不足时基于专业知识回答
+- **因材施教**：根据问题难度调整讲解深度，新手侧重基础，进阶者侧重原理
+- **代码示例**：必要时提供完整可运行的代码示例（用代码块包裹）
+- **中文为主**：使用简洁中文，专业术语保留英文原文
+
+## 交互方式
+- 理解用户意图：区分代码审查、概念咨询、错误排查等场景
+- 灵活处理输入：支持代码片段、完整程序、错误信息、概念问题等多种格式
+- 保持上下文：在多轮对话中记住之前的讨论内容`;
 
 interface DocChunk {
     fileName: string;
@@ -50,12 +64,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.loadDocumentsWithEmbeddings();
     }
 
-    // 对话历史，初始带普通提示词
+    // 对话历史，初始带系统提示词
     private conversationHistory: Array<{
         role: 'system' | 'user' | 'assistant';
         content: string
     }> = [
-        { role: 'system', content: GENERAL_SYSTEM_PROMPT }
+        { role: 'system', content: SYSTEM_PROMPT }
     ];
 
     public resolveWebviewView(
@@ -101,19 +115,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         );
     }
 
-    // 系统提示（动态选择：代码问题用结构化，普通问题用简洁）
-    private getSystemPrompt(isCodeQuestion: boolean): { role: 'system'; content: string } {
-        return {
-            role: 'system',
-            content: isCodeQuestion ? CODE_SYSTEM_PROMPT : GENERAL_SYSTEM_PROMPT
-        };
-    }
-
     // 调用 Ollama 多轮对话接口（自动注入系统提示到最前）
-    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>, isCodeQuestion: boolean = false): Promise<string> {
+    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
         // 移除历史中可能存在的旧系统消息，插入最新的系统提示到最前
         const messagesWithoutSystem = messages.filter(m => m.role !== 'system');
-        const finalMessages = [this.getSystemPrompt(isCodeQuestion), ...messagesWithoutSystem];
+        const finalMessages = [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messagesWithoutSystem];
 
         return new Promise((resolve) => {
             try {
@@ -413,28 +419,19 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 userContent = `用户问题：${question}`;
             }
             
-            // 仅当问题涉及代码分析时，才拼接选中代码（避免无关问题携带代码）
-            const codeRelatedKeywords = ['代码', '这段', '本段', '分析', '语法', '错误', '修正', '检查', '这段代码', '语法检查', '本段代码'];
-            
+            // 如果有选中代码，始终拼接（不再限制格式和关键词）
             if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
                 const ctx = AiAssistantViewProvider.selectedCodeContext;
-                const isCodeRelated = codeRelatedKeywords.some(kw => question.includes(kw));
-                if (isCodeRelated) {
-                    userContent += `\n\n附：待分析代码\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`${ctx.language}\n${ctx.code}\n\`\`\``;
-                    // 拼接后清空，避免下次无关问题继续携带
-                    AiAssistantViewProvider.selectedCodeContext = null;
-                }
+                userContent += `\n\n附：相关代码\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`${ctx.language}\n${ctx.code}\n\`\`\``;
+                // 拼接后清空，避免下次问题继续携带
+                AiAssistantViewProvider.selectedCodeContext = null;
             }
-
-            // 判断是否为代码相关问题
-            const codeKeywords = ['代码', '这段', '本段', '分析', '语法', '错误', '修正', '检查', '语法检查', '本段代码'];
-            const isCodeQuestion = codeKeywords.some(kw => question.includes(kw));
 
             // 用户消息加入历史
             this.conversationHistory.push({ role: 'user', content: userContent });
 
-            // 传入完整历史调用大模型，根据问题类型选择系统提示
-            const rawAnswer = await this.callOllama(this.conversationHistory, isCodeQuestion);
+            // 传入完整历史调用大模型
+            const rawAnswer = await this.callOllama(this.conversationHistory);
 
             // 先把大模型原始回答存入历史（不含手动拼接的来源说明，避免历史污染）
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
@@ -482,8 +479,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
     private handleClearChat() {
         AiAssistantViewProvider.selectedCodeContext = null;
-        this.conversationHistory = [ // 重置为普通提示词
-            { role: 'system', content: GENERAL_SYSTEM_PROMPT }
+        this.conversationHistory = [ // 重置为系统提示词
+            { role: 'system', content: SYSTEM_PROMPT }
         ];
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
