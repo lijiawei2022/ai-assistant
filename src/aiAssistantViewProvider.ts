@@ -9,7 +9,10 @@ const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
 const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'nomic-embed-text';
 const CHUNK_SIZE = 500;
-const SIMILARITY_THRESHOLD = 0.6;
+// RRF标准实现无需阈值，仅按融合分数排序取Top N
+const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按你最初要求）
+const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数
+const POST_RRF_THRESHOLD = 0.025;  // RRF后置截断阈值（保留弱相关匹配）
 
 interface DocChunk {
     fileName: string;
@@ -255,41 +258,67 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         const questionEmbedding = await this.generateEmbedding(question);
         let useVector = questionEmbedding.length > 0;
 
-        // 计算所有块的相似度（混合打分）
-        const results = docChunks.map(chunk => {
-            // 向量相似度
-            let vectorScore = 0;
-            if (useVector && chunk.embedding.length > 0) {
-                vectorScore = this.cosineSimilarity(questionEmbedding, chunk.embedding);
-            }
+        // 计算向量检索排名（预过滤 similarity ≥ 0.45）
+        const vectorCandidates = docChunks.map(chunk => {
+            const score = (useVector && chunk.embedding.length > 0) 
+                ? this.cosineSimilarity(questionEmbedding, chunk.embedding) : 0;
+            return { chunk, score };
+        }).filter(item => item.score >= VECTOR_THRESHOLD); // 候选集A
 
-            // 关键词匹配得分
-            let keywordScore = 0;
+        const vectorSorted = vectorCandidates.sort((a, b) => b.score - a.score);
+        const vectorRankMap = new Map<DocChunk, number>();
+        vectorSorted.forEach((item, index) => {
+            vectorRankMap.set(item.chunk, index + 1); // 仅对候选集A排名
+        });
+        console.log(`RAG: Vector candidates (≥${VECTOR_THRESHOLD}): ${vectorCandidates.length}`);
+
+        // 计算关键词检索排名（预过滤 matchCount ≥ 1）
+        const keywordCandidates = docChunks.map(chunk => {
+            let keywordCount = 0;
             const chunkLower = chunk.content.toLowerCase();
             for (const kw of keywords) {
                 if (chunkLower.includes(kw.toLowerCase())) {
-                    keywordScore += 1;
+                    keywordCount += 1;
                 }
             }
-            // 归一化关键词得分
-            keywordScore = keywords.length > 0 ? keywordScore / keywords.length : 0;
+            return { chunk, score: keywordCount };
+        }).filter(item => item.score >= KEYWORD_MIN_MATCH); // 候选集B
 
-            // 混合得分：向量占40%，关键词占60%（关键词对中文更可靠）
-            const hybridScore = vectorScore * 0.4 + keywordScore * 0.6;
+        const keywordSorted = keywordCandidates.sort((a, b) => b.score - a.score);
+        const keywordRankMap = new Map<DocChunk, number>();
+        keywordSorted.forEach((item, index) => {
+            keywordRankMap.set(item.chunk, index + 1); // 仅对候选集B排名
+        });
+        console.log(`RAG: Keyword candidates (≥${KEYWORD_MIN_MATCH} matches): ${keywordCandidates.length}`);
 
-            return { chunk, similarity: hybridScore, vectorScore, keywordScore };
+        // 取A∪B，计算RRF分数
+        const candidateChunks = new Set<DocChunk>();
+        vectorRankMap.forEach((rank, chunk) => candidateChunks.add(chunk));
+        keywordRankMap.forEach((rank, chunk) => candidateChunks.add(chunk));
+        console.log(`RAG: Union candidates (A∪B): ${candidateChunks.size}`);
+
+        const k = 60;
+        const results = Array.from(candidateChunks).map(chunk => {
+            const rankVector = vectorRankMap.get(chunk) || Number.MAX_SAFE_INTEGER;
+            const rankKeyword = keywordRankMap.get(chunk) || Number.MAX_SAFE_INTEGER;
+            
+            const rrfVector = rankVector !== Number.MAX_SAFE_INTEGER ? 1 / (k + rankVector) : 0;
+            const rrfKeyword = rankKeyword !== Number.MAX_SAFE_INTEGER ? 1 / (k + rankKeyword) : 0;
+            const rrfScore = rrfVector + rrfKeyword;
+            
+            return { chunk, rrfScore, rankVector, rankKeyword, rrfVector, rrfKeyword };
         });
 
-        // 输出相似度分数用于调试
+        // 输出RRF分数用于调试
         results.forEach(r => {
-            console.log(`RAG: Hybrid=${r.similarity.toFixed(4)} (Vector=${r.vectorScore.toFixed(4)}, Keyword=${r.keywordScore.toFixed(4)}) with ${r.chunk.fileName}`);
+            console.log(`RAG: RRF=${r.rrfScore.toFixed(6)} (VectorRank=${r.rankVector}, KeywordRank=${r.rankKeyword}) with ${r.chunk.fileName}`);
         });
 
-        // 按混合相似度过滤（阈值0.3）并排序取Top3
+        // 后置截断：RRF ≥ 0.015，排序取Top10
         const topResults = results
-          .filter(r => r.similarity >= 0.3)
-          .sort((a, b) => b.similarity - a.similarity)
-          .slice(0, 3);
+            .filter(r => r.rrfScore >= POST_RRF_THRESHOLD)
+            .sort((a, b) => b.rrfScore - a.rrfScore)
+            .slice(0, 10);
 
         if (topResults.length === 0) {
             return { contextText: '', fileNames: [] };
@@ -314,9 +343,21 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         const englishWords = lowerText.match(/[a-z]{2,}/g) || [];
         keywords.push(...englishWords);
         
-        // 提取中文词组（长度>=2的连续汉字）
-        const chineseWords = lowerText.match(/[\u4e00-\u9fa5]{2,}/g) || [];
-        keywords.push(...chineseWords);
+        // 提取中文：所有2字以上连续子串（解决长句无法拆分问题）
+        const chineseSegments = lowerText.match(/[\u4e00-\u9fa5]+/g) || [];
+        for (const segment of chineseSegments) {
+            // 生成所有可能的2字以上子串
+            for (let i = 0; i < segment.length; i++) {
+                for (let j = i + 1; j < segment.length; j++) {
+                    const substr = segment.substring(i, j + 1);
+                    if (substr.length >= 2) {
+                        keywords.push(substr);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         
         // 去重
         return [...new Set(keywords)];
@@ -352,11 +393,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             // 传入完整历史调用大模型
             let answer = await this.callOllama(this.conversationHistory);
 
-            // 拼接来源说明
+            // 按用户要求拼接来源说明
             if (useRag && ragResult.fileNames.length > 0) {
-                answer += `\n\n根据知识库中的${ragResult.fileNames.join(", ")}生成`;
+                // 有匹配文档：将文档+问题+对话历史提交给大模型，根据文档回答
+                answer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}，本地大模型根据相关文档回答`;
             } else {
-                answer += `\n\n根据大模型回答`;
+                // 无匹配文档：大模型直接根据问题和对话历史回答
+                answer += `\n\n知识库中无相关文档，本地大模型直接回答`;
             }
 
             // 大模型回复加入历史
