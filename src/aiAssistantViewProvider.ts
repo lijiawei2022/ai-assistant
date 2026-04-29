@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 
 // 配置
-const OLLAMA_URL = 'http://localhost:11434/api/generate';
+const OLLAMA_URL = 'http://localhost:11434/api/chat';
 const LLM_MODEL = 'qwen2.5-coder:3b';
 
 export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
@@ -12,10 +12,18 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri;
     private readonly _context: vscode.ExtensionContext;
     
-    constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
-        this._extensionUri = extensionUri;
-        this._context = context;
-    }
+constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
+    this._extensionUri = extensionUri;
+    this._context = context;
+}
+
+// 对话历史，初始带系统提示
+private conversationHistory: Array<{
+    role: 'system' | 'user' | 'assistant';
+    content: string
+}> = [
+    { role: 'system', content: '你是一个专业的编程助手，请用中文简洁回答用户的问题。' }
+];
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
@@ -60,13 +68,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         );
     }
 
-    // 调用 Ollama
-    private callOllama(prompt: string): Promise<string> {
+    // 调用 Ollama 多轮对话接口
+    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
         return new Promise((resolve) => {
             try {
                 const body = JSON.stringify({
                     model: LLM_MODEL,
-                    prompt: prompt,
+                    messages: messages,
                     stream: false
                 });
                 
@@ -82,7 +90,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     }
                     try {
                         const data = JSON.parse(stdout);
-                        resolve(data.response || '未收到有效响应');
+                        resolve(data.message?.content || '未收到有效响应');
                     } catch (e) {
                         resolve('解析响应失败: ' + stdout.substring(0, 100));
                     }
@@ -102,14 +110,23 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            let fullQuestion = `你是一个专业的编程助手。请用中文简洁回答以下问题：\n\n问题：${question}`;
+            // 构造用户消息内容
+            let userContent = question;
             
+            // 拼接选中的代码上下文（如果有）
             if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
                 const ctx = AiAssistantViewProvider.selectedCodeContext;
-                fullQuestion += `\n\n另外，以下是用户选中的代码供参考：\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`\n${ctx.code}\n\`\`\``;
+                userContent += `\n\n参考代码：\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`\n${ctx.code}\n\`\`\``;
             }
 
-            let answer = await this.callOllama(fullQuestion);
+            // 用户消息加入历史
+            this.conversationHistory.push({ role: 'user', content: userContent });
+
+            // 传入完整历史调用大模型
+            let answer = await this.callOllama(this.conversationHistory);
+
+            // 大模型回复加入历史
+            this.conversationHistory.push({ role: 'assistant', content: answer });
 
             if (AiAssistantViewProvider.currentPanel) {
                 AiAssistantViewProvider.currentPanel.webview.postMessage({
@@ -145,6 +162,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
     private handleClearChat() {
         AiAssistantViewProvider.selectedCodeContext = null;
+        this.conversationHistory = [ // 重置为仅系统提示
+            { role: 'system', content: '你是一个专业的编程助手，请用中文简洁回答用户的问题。' }
+        ];
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
                 type: 'clearChat'
