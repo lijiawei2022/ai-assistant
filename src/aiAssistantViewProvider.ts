@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
 // 配置
 const OLLAMA_URL = 'http://localhost:11434/api/chat';
@@ -9,6 +10,7 @@ const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
 const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'nomic-embed-text';
 const CHUNK_SIZE = 500;
+const CHUNK_OVERLAP = 50;  // 递归分块重叠大小
 // RRF标准实现无需阈值，仅按融合分数排序取Top N
 const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按最初要求）
 const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数（避免单关键词误匹配）
@@ -45,6 +47,16 @@ interface DocChunk {
     fileName: string;
     content: string;
     embedding: number[];
+}
+
+interface RetrievalResult {
+    fileName: string;
+    content: string;
+    vectorScore?: number;
+    keywordScore?: number;
+    rrfScore: number;
+    rankVector?: number;
+    rankKeyword?: number;
 }
 
 let docChunks: DocChunk[] = [];
@@ -159,9 +171,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            // 优先用工作区根目录，没有的话用扩展所在目录（确保能找到documents文件夹）
-            const workspaceRoot = vscode.workspace.rootPath || this._context.extensionPath;
-            const documentsPath = path.join(workspaceRoot, 'documents');
+            // 始终使用扩展所在目录查找documents文件夹（documents随扩展安装）
+            const documentsPath = path.join(this._context.extensionPath, 'documents');
             console.log(`RAG: Documents path: ${documentsPath}`);
 
             if (!fs.existsSync(documentsPath)) {
@@ -176,35 +187,29 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             for (const file of files) {
                 const ext = path.extname(file).toLowerCase();
                 if (ext !== '.txt' && ext !== '.md') {
+                    console.log(`RAG: Skipping unsupported file: ${file}`);
                     continue;
                 }
 
                 const filePath = path.join(documentsPath, file);
                 const content = fs.readFileSync(filePath, 'utf-8');
+                console.log(`RAG: Processing file: ${file}, content length: ${content.length}`);
                 
-                // 按行分块
-                const lines = content.split('\n');
-                let chunkContent = '';
+                // 使用LangChain的RecursiveCharacterTextSplitter
+                const splitter = new RecursiveCharacterTextSplitter({
+                    chunkSize: CHUNK_SIZE,
+                    chunkOverlap: CHUNK_OVERLAP,
+                });
+                const chunks = await splitter.splitText(content);
+                console.log(`RAG: File ${file} split into ${chunks.length} chunks`);
                 
-                for (const line of lines) {
-                    chunkContent += line + '\n';
-                    if (chunkContent.length >= CHUNK_SIZE) {
-                        // 为当前块生成向量
-                        const embedding = await this.generateEmbedding(chunkContent);
-                        if (embedding.length > 0) {
-                            docChunks.push({ fileName: file, content: chunkContent, embedding });
-                            totalChunks++;
-                        }
-                        chunkContent = '';
-                    }
-                }
-                
-                // 处理最后一块
-                if (chunkContent.trim().length > 0) {
+                for (const chunkContent of chunks) {
                     const embedding = await this.generateEmbedding(chunkContent);
                     if (embedding.length > 0) {
                         docChunks.push({ fileName: file, content: chunkContent, embedding });
                         totalChunks++;
+                    } else {
+                        console.log(`RAG: Failed to generate embedding for chunk (length: ${chunkContent.length})`);
                     }
                 }
             }
@@ -266,7 +271,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     // 检索相关文档（混合检索：向量 + 关键词）
-    private async retrieveRelevantDocs(question: string): Promise<{ contextText: string; fileNames: string[] }> {
+    private async retrieveRelevantDocs(question: string): Promise<{
+        contextText: string;
+        fileNames: string[];
+        retrievalDetails: RetrievalResult[];
+    }> {
         // 强制等待文档加载完成
         if (!docsLoaded) {
             console.log('RAG: Waiting for documents to load...');
@@ -276,7 +285,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         if (docChunks.length === 0) {
             console.log('RAG: No document chunks available');
-            return { contextText: '', fileNames: [] };
+            return { contextText: '', fileNames: [], retrievalDetails: [] };
         }
 
         console.log(`RAG: Searching among ${docChunks.length} chunks for: ${question}`);
@@ -352,17 +361,31 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             .slice(0, 10);
 
         if (topResults.length === 0) {
-            return { contextText: '', fileNames: [] };
+            return { contextText: '', fileNames: [], retrievalDetails: [] };
         }
 
         const fileNames = [...new Set(topResults.map(r => r.chunk.fileName))];
         let contextText = '以下是知识库中相关的内容，请根据这些内容回答问题。\n\n知识库内容：\n';
+        const retrievalDetails: RetrievalResult[] = [];
+        
         for (const result of topResults) {
             contextText += `\n【文件: ${result.chunk.fileName}】\n\`\`\`\n${result.chunk.content}\n\`\`\`\n---\n`;
+            retrievalDetails.push({
+                fileName: result.chunk.fileName,
+                content: result.chunk.content,
+                vectorScore: result.rankVector !== Number.MAX_SAFE_INTEGER ? 
+                    (vectorRankMap.get(result.chunk) ? 
+                        this.cosineSimilarity(questionEmbedding, result.chunk.embedding) : 0) : undefined,
+                keywordScore: result.rankKeyword !== Number.MAX_SAFE_INTEGER ? 
+                    keywordRankMap.get(result.chunk) || undefined : undefined,
+                rrfScore: result.rrfScore,
+                rankVector: result.rankVector !== Number.MAX_SAFE_INTEGER ? result.rankVector : undefined,
+                rankKeyword: result.rankKeyword !== Number.MAX_SAFE_INTEGER ? result.rankKeyword : undefined
+            });
         }
 
         console.log(`RAG: Found relevant docs: ${fileNames.join(", ")}`);
-        return { contextText, fileNames };
+        return { contextText, fileNames, retrievalDetails };
     }
 
     // 提取关键词（支持中英文）
@@ -444,12 +467,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 finalAnswer += `\n\n知识库中无相关文档，本地大模型直接回答`;
             }
 
-            // 发送最终回答给前端
+            // 发送最终回答给前端（包含检索详情）
             if (AiAssistantViewProvider.currentPanel) {
                 AiAssistantViewProvider.currentPanel.webview.postMessage({
                     type: 'aiResponse',
                     response: finalAnswer,
-                    hasContext: hasContext
+                    hasContext: hasContext,
+                    retrievalDetails: ragResult.retrievalDetails || []
                 });
             }
 

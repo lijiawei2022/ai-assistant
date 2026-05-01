@@ -52,7 +52,7 @@
         statusElement.textContent = 'Code context loaded';
     }
 
-    function addMessage(text, isUser = false, isError = false) {
+    function addMessage(text, isUser = false, isError = false, retrievalDetails = null) {
         const messageDiv = document.createElement('div');
         messageDiv.className = `message ${isUser ? 'user-message' : 'ai-message'}`;
         if (isError) messageDiv.classList.add('error-message');
@@ -68,8 +68,66 @@
         
         messageDiv.appendChild(label);
         messageDiv.appendChild(content);
+        
+        // 如果有检索详情，添加调试面板
+        if (!isUser && retrievalDetails && retrievalDetails.length > 0) {
+            const debugPanel = createDebugPanel(retrievalDetails);
+            messageDiv.appendChild(debugPanel);
+        }
+        
         chatMessages.appendChild(messageDiv);
         chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+    
+    function createDebugPanel(details) {
+        const panel = document.createElement('details');
+        panel.className = 'debug-panel';
+        panel.open = false;
+        
+        const summary = document.createElement('summary');
+        summary.className = 'debug-summary';
+        summary.textContent = `🔍 检索详情 (${details.length} 个文档块)`;
+        
+        const content = document.createElement('div');
+        content.className = 'debug-content';
+        
+        details.forEach((doc, index) => {
+            const docDiv = document.createElement('div');
+            docDiv.className = 'debug-doc';
+            
+            // 分数信息
+            const scoresDiv = document.createElement('div');
+            scoresDiv.className = 'debug-scores';
+            let scoreText = `RRF: ${doc.rrfScore.toFixed(4)}`;
+            if (doc.vectorScore !== undefined) {
+                scoreText += ` | 向量: ${doc.vectorScore.toFixed(4)}`;
+            }
+            if (doc.keywordScore !== undefined) {
+                scoreText += ` | 关键词: ${doc.keywordScore}`;
+            }
+            scoresDiv.textContent = `📊 ${scoreText}`;
+            
+            // 文档内容
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'debug-doc-content';
+            const displayContent = doc.content.length > 300 ? 
+                doc.content.substring(0, 300) + '...' : doc.content;
+            contentDiv.textContent = displayContent;
+            
+            // 文件信息
+            const fileDiv = document.createElement('div');
+            fileDiv.className = 'debug-file';
+            fileDiv.textContent = `📄 ${doc.fileName}`;
+            
+            docDiv.appendChild(scoresDiv);
+            docDiv.appendChild(fileDiv);
+            docDiv.appendChild(contentDiv);
+            content.appendChild(docDiv);
+        });
+        
+        panel.appendChild(summary);
+        panel.appendChild(content);
+        return panel;
     }
 
     function clearChat() {
@@ -113,7 +171,7 @@
         const message = event.data;
         switch (message.type) {
             case 'aiResponse':
-                addMessage(message.response, false, message.isError);
+                addMessage(message.response, false, message.isError, message.retrievalDetails);
                 statusElement.textContent = 'Response received';
                 break;
             case 'selectedCode':
