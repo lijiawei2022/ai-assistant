@@ -69,6 +69,8 @@ interface RetrievalResult {
 
 let docChunks: DocChunk[] = [];
 let docsLoaded = false;
+let modelConnected = false; // 大模型连接状态
+let initCompleted = false; // 初始化是否完成
 
 export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiAssistantView';
@@ -80,8 +82,68 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this._extensionUri = extensionUri;
         this._context = context;
-        // 初始化时加载文档（异步）
-        this.loadDocumentsWithEmbeddings();
+        // 启动时自动初始化：加载文档 + 检查模型连接
+        this.initialize();
+    }
+
+    // 初始化：加载文档向量 + 检查大模型连接
+    private async initialize(): Promise<void> {
+        console.log('RAG: Starting initialization...');
+
+        // 并行执行文档加载和模型连接检查
+        const [modelOk] = await Promise.all([
+            this.checkModelConnection(),
+            this.loadDocumentsWithEmbeddings()
+        ]);
+
+        modelConnected = modelOk;
+        initCompleted = true;
+
+        // 通知前端初始化完成
+        if (AiAssistantViewProvider.currentPanel) {
+            AiAssistantViewProvider.currentPanel.webview.postMessage({
+                type: 'initComplete',
+                modelConnected: modelConnected,
+                docsLoaded: docsLoaded,
+                chunkCount: docChunks.length
+            });
+        }
+
+        console.log(`RAG: Initialization complete. Model: ${modelConnected ? 'OK' : 'Failed'}, Docs: ${docChunks.length} chunks`);
+    }
+
+    // 检查大模型连接
+    private async checkModelConnection(): Promise<boolean> {
+        return new Promise((resolve) => {
+            try {
+                const body = JSON.stringify({
+                    model: LLM_MODEL,
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: false
+                });
+
+                cp.execFile('curl', [
+                    '-s', '-X', 'POST',
+                    OLLAMA_URL,
+                    '-H', 'Content-Type: application/json',
+                    '-d', body
+                ], { timeout: 10000 }, (error, stdout) => {
+                    if (error) {
+                        console.log('RAG: Model connection failed:', error.message);
+                        resolve(false);
+                        return;
+                    }
+                    try {
+                        const data = JSON.parse(stdout);
+                        resolve(!!data.message?.content);
+                    } catch (e) {
+                        resolve(false);
+                    }
+                });
+            } catch (e) {
+                resolve(false);
+            }
+        });
     }
 
     // 对话历史，初始带系统提示词
