@@ -14,10 +14,15 @@ const CHUNK_SIZE = 500;
 const CHUNK_OVERLAP = 50;  // 递归分块重叠大小
 const CACHE_DIR_NAME = 'documents_xiangliang';
 const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
-// RRF标准实现无需阈值，仅按融合分数排序取Top N
-const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按最初要求）
-const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数（避免单关键词误匹配）
-const POST_RRF_THRESHOLD = 0.025;  // RRF后置截断阈值（保留弱相关匹配）
+// 检索参数配置
+const VECTOR_THRESHOLD = 0.35;   // 向量检索预过滤阈值（余弦相似度，0.3-0.4较合理）
+const BM25_MIN_SCORE = 0.1;      // BM25最小分数阈值（过滤明显不相关的）
+const RRF_K = 60;                // RRF公式中的k值（标准值为60）
+const TOP_K = 10;                // 最终返回的文档块数量
+
+// BM25参数
+const BM25_K1 = 1.5;              // 词频饱和参数（标准值1.2-2.0）
+const BM25_B = 0.75;              // 文档长度归一化参数（标准值0.75）
 
 // 系统设计提示词：面向程序设计领域的AI助教
 const SYSTEM_PROMPT = `你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。
@@ -279,6 +284,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             }
 
             docChunks = newDocChunks;
+            this.buildBM25Index();
             docsLoaded = true;
             console.log(`RAG: Loaded ${totalChunks} document chunks from ${files.length} files (with incremental cache)`);
         } catch (error) {
@@ -377,24 +383,18 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         });
         console.log(`RAG: Vector candidates (≥${VECTOR_THRESHOLD}): ${vectorCandidates.length}`);
 
-        // 计算关键词检索排名（预过滤 matchCount ≥ 1）
-        const keywordCandidates = docChunks.map(chunk => {
-            let keywordCount = 0;
-            const chunkLower = chunk.content.toLowerCase();
-            for (const kw of keywords) {
-                if (chunkLower.includes(kw.toLowerCase())) {
-                    keywordCount += 1;
-                }
-            }
-            return { chunk, score: keywordCount };
-        }).filter(item => item.score >= KEYWORD_MIN_MATCH); // 候选集B
+        // 计算关键词检索排名（使用BM25算法）
+        const keywordCandidates = docChunks.map((chunk, index) => {
+            const score = this.calculateBM25Score(keywords, index);
+            return { chunk, score };
+        }).filter(item => item.score >= BM25_MIN_SCORE); // 候选集B（BM25分数≥阈值）
 
         const keywordSorted = keywordCandidates.sort((a, b) => b.score - a.score);
         const keywordRankMap = new Map<DocChunk, number>();
         keywordSorted.forEach((item, index) => {
-            keywordRankMap.set(item.chunk, index + 1); // 仅对候选集B排名
+            keywordRankMap.set(item.chunk, index + 1);
         });
-        console.log(`RAG: Keyword candidates (≥${KEYWORD_MIN_MATCH} matches): ${keywordCandidates.length}`);
+        console.log(`RAG: Keyword candidates (BM25>0): ${keywordCandidates.length}`);
 
         // 取A∪B，计算RRF分数
         const candidateChunks = new Set<DocChunk>();
@@ -402,15 +402,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         keywordRankMap.forEach((rank, chunk) => candidateChunks.add(chunk));
         console.log(`RAG: Union candidates (A∪B): ${candidateChunks.size}`);
 
-        const k = 60;
         const results = Array.from(candidateChunks).map(chunk => {
             const rankVector = vectorRankMap.get(chunk) || Number.MAX_SAFE_INTEGER;
             const rankKeyword = keywordRankMap.get(chunk) || Number.MAX_SAFE_INTEGER;
-            
-            const rrfVector = rankVector !== Number.MAX_SAFE_INTEGER ? 1 / (k + rankVector) : 0;
-            const rrfKeyword = rankKeyword !== Number.MAX_SAFE_INTEGER ? 1 / (k + rankKeyword) : 0;
+
+            const rrfVector = rankVector !== Number.MAX_SAFE_INTEGER ? 1 / (RRF_K + rankVector) : 0;
+            const rrfKeyword = rankKeyword !== Number.MAX_SAFE_INTEGER ? 1 / (RRF_K + rankKeyword) : 0;
             const rrfScore = rrfVector + rrfKeyword;
-            
+
             return { chunk, rrfScore, rankVector, rankKeyword, rrfVector, rrfKeyword };
         });
 
@@ -419,11 +418,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             console.log(`RAG: RRF=${r.rrfScore.toFixed(6)} (VectorRank=${r.rankVector}, KeywordRank=${r.rankKeyword}) with ${r.chunk.fileName}`);
         });
 
-        // 后置截断：RRF ≥ 0.015，排序取Top10
+        // 按RRF分数排序，取Top K
         const topResults = results
-            .filter(r => r.rrfScore >= POST_RRF_THRESHOLD)
             .sort((a, b) => b.rrfScore - a.rrfScore)
-            .slice(0, 10);
+            .slice(0, TOP_K);
 
         if (topResults.length === 0) {
             return { contextText: '', fileNames: [], retrievalDetails: [] };
@@ -456,6 +454,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     // 停用词集合
     private stopWords: Set<string> | null = null;
 
+    // BM25相关字段
+    private bm25Ready: boolean = false;
+    private docTermFreqs: Map<string, number>[] = [];  // 每篇文档的词频映射
+    private docFreqs: Map<string, number> = new Map(); // 词在多少篇文档中出现
+    private avgdl: number = 0;
+    private totalDocs: number = 0;
+
     // 加载停用词
     private loadStopWords(): Set<string> {
         if (this.stopWords !== null) {
@@ -480,6 +485,88 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             console.log('RAG: Failed to load stop words, using empty set');
         }
         return this.stopWords;
+    }
+
+    // 构建BM25索引
+    private buildBM25Index(): void {
+        if (docChunks.length === 0) {
+            return;
+        }
+
+        const stopWords = this.loadStopWords();
+        this.docTermFreqs = [];
+        this.docFreqs.clear();
+        let totalLength = 0;
+
+        // 对每个文档分词并统计词频
+        for (const chunk of docChunks) {
+            let words: string[] = [];
+            try {
+                words = nodejieba.cut(chunk.content, true)
+                    .map(w => w.trim().toLowerCase())
+                    .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !stopWords.has(w));
+            } catch (e) {
+                words = chunk.content.split(/[\s\.,;:!?，。；：！？]+/)
+                    .map(w => w.toLowerCase())
+                    .filter(w => w.length >= 2 && !stopWords.has(w));
+            }
+
+            // 计算该文档的词频
+            const termFreq = new Map<string, number>();
+            for (const word of words) {
+                termFreq.set(word, (termFreq.get(word) || 0) + 1);
+            }
+            this.docTermFreqs.push(termFreq);
+
+            // 统计文档频率（词出现在多少篇文档中）
+            const uniqueWords = new Set(words);
+            for (const word of uniqueWords) {
+                this.docFreqs.set(word, (this.docFreqs.get(word) || 0) + 1);
+            }
+
+            totalLength += words.length;
+        }
+
+        this.totalDocs = docChunks.length;
+        this.avgdl = totalLength / this.totalDocs;
+        this.bm25Ready = true;
+        console.log(`RAG: BM25 index built with ${this.totalDocs} docs, avgdl=${this.avgdl.toFixed(2)}`);
+    }
+
+    // 计算标准BM25分数
+    private calculateBM25Score(queryKeywords: string[], docIndex: number): number {
+        if (!this.bm25Ready || docIndex >= docChunks.length) {
+            return 0;
+        }
+
+        const termFreq = this.docTermFreqs[docIndex];
+        if (!termFreq) return 0;
+
+        // 计算文档长度（词数）
+        let dl = 0;
+        for (const count of termFreq.values()) {
+            dl += count;
+        }
+
+        let score = 0;
+
+        for (const queryWord of queryKeywords) {
+            const tf = termFreq.get(queryWord) || 0;
+            if (tf === 0) continue;
+
+            const df = this.docFreqs.get(queryWord) || 0;
+            if (df === 0) continue;
+
+            // 标准BM25 IDF: log((N - df + 0.5) / (df + 0.5))
+            const idf = Math.log((this.totalDocs - df + 0.5) / (df + 0.5));
+
+            // BM25公式: IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl)))
+            const numerator = tf * (BM25_K1 + 1);
+            const denominator = tf + BM25_K1 * (1 - BM25_B + BM25_B * (dl / this.avgdl));
+            score += idf * (numerator / denominator);
+        }
+
+        return score;
     }
 
     // 提取关键词（使用jieba分词+停用词过滤）
