@@ -18,7 +18,8 @@ const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
 const VECTOR_THRESHOLD = 0.35;   // 向量检索预过滤阈值（余弦相似度，0.3-0.4较合理）
 const BM25_MIN_SCORE = 0.1;      // BM25最小分数阈值（过滤明显不相关的）
 const RRF_K = 60;                // RRF公式中的k值（标准值为60）
-const TOP_K = 10;                // 最终返回的文档块数量
+const RRF_TOP_K = 30;            // RRF选出候选数
+const RERANK_TOP_K = 5;          // rerank后最终返回数量
 
 // BM25参数
 const BM25_K1 = 1.5;              // 词频饱和参数（标准值1.2-2.0）
@@ -71,6 +72,8 @@ let docChunks: DocChunk[] = [];
 let docsLoaded = false;
 let modelConnected = false; // 大模型连接状态
 let initCompleted = false; // 初始化是否完成
+let rerankerPipeline: any = null; // 交叉编码器pipeline缓存
+let rerankerLoading = false; // 防止重复加载
 
 export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiAssistantView';
@@ -86,7 +89,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.initialize();
     }
 
-    // 初始化：加载文档向量 + 检查大模型连接
+    // 初始化：加载文档向量 + 检查大模型连接 + 加载reranker
     private async initialize(): Promise<void> {
         console.log('RAG: Starting initialization...');
 
@@ -97,6 +100,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         ]);
 
         modelConnected = modelOk;
+
+        // 加载交叉编码器模型（异步，不阻塞初始化）
+        this.loadReranker().then(() => {
+            console.log('RAG: Reranker model ready');
+        });
+
         initCompleted = true;
 
         // 通知前端初始化完成
@@ -480,36 +489,47 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             console.log(`RAG: RRF=${r.rrfScore.toFixed(6)} (VectorRank=${r.rankVector}, KeywordRank=${r.rankKeyword}) with ${r.chunk.fileName}`);
         });
 
-        // 按RRF分数排序，取Top K
-        const topResults = results
+        // 按RRF分数排序，取Top K作为候选
+        const rrfResults = results
             .sort((a, b) => b.rrfScore - a.rrfScore)
-            .slice(0, TOP_K);
+            .slice(0, RRF_TOP_K);
 
-        if (topResults.length === 0) {
+        // 保存原始RRF分数映射，用于展示
+        const rrfScoreMap = new Map<DocChunk, number>();
+        rrfResults.forEach(r => rrfScoreMap.set(r.chunk, r.rrfScore));
+
+        if (rrfResults.length === 0) {
             return { contextText: '', fileNames: [], retrievalDetails: [] };
         }
 
-        const fileNames = [...new Set(topResults.map(r => r.chunk.fileName))];
+        // 对RRF候选结果进行rerank，选出最终top k
+        const rerankedResults = await this.rerankDocs(question, rrfResults);
+
+        if (rerankedResults.length === 0) {
+            return { contextText: '', fileNames: [], retrievalDetails: [] };
+        }
+
+        const fileNames = [...new Set(rerankedResults.map(r => r.chunk.fileName))];
         let contextText = '以下是知识库中相关的内容，请根据这些内容回答问题。\n\n知识库内容：\n';
         const retrievalDetails: RetrievalResult[] = [];
-        
-        for (const result of topResults) {
+
+        for (const result of rerankedResults) {
             contextText += `\n【文件: ${result.chunk.fileName}】\n\`\`\`\n${result.chunk.content}\n\`\`\`\n---\n`;
+            const originalRrfScore = rrfScoreMap.get(result.chunk) || result.rerankScore;
             retrievalDetails.push({
                 fileName: result.chunk.fileName,
                 content: result.chunk.content,
-                vectorScore: result.rankVector !== Number.MAX_SAFE_INTEGER ? 
-                    (vectorRankMap.get(result.chunk) ? 
-                        this.cosineSimilarity(questionEmbedding, result.chunk.embedding) : 0) : undefined,
-                keywordScore: result.rankKeyword !== Number.MAX_SAFE_INTEGER ? 
+                vectorScore: result.rankVector !== undefined && result.rankVector !== Number.MAX_SAFE_INTEGER ?
+                    this.cosineSimilarity(questionEmbedding, result.chunk.embedding) : undefined,
+                keywordScore: result.rankKeyword !== undefined && result.rankKeyword !== Number.MAX_SAFE_INTEGER ?
                     keywordRankMap.get(result.chunk) || undefined : undefined,
-                rrfScore: result.rrfScore,
-                rankVector: result.rankVector !== Number.MAX_SAFE_INTEGER ? result.rankVector : undefined,
-                rankKeyword: result.rankKeyword !== Number.MAX_SAFE_INTEGER ? result.rankKeyword : undefined
+                rrfScore: originalRrfScore,
+                rankVector: result.rankVector !== undefined && result.rankVector !== Number.MAX_SAFE_INTEGER ? result.rankVector : undefined,
+                rankKeyword: result.rankKeyword !== undefined && result.rankKeyword !== Number.MAX_SAFE_INTEGER ? result.rankKeyword : undefined
             });
         }
 
-        console.log(`RAG: Found relevant docs: ${fileNames.join(", ")}`);
+        console.log(`RAG: Found relevant docs after rerank: ${fileNames.join(", ")}`);
         return { contextText, fileNames, retrievalDetails };
     }
 
@@ -629,6 +649,86 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         return score;
+    }
+
+    // 加载交叉编码器模型（用于rerank）
+    private async loadReranker(): Promise<void> {
+        if (rerankerPipeline || rerankerLoading) {
+            return;
+        }
+        rerankerLoading = true;
+        try {
+            console.log('RAG: Loading cross-encoder model for reranking...');
+            // 动态导入以支持 ES Module
+            const { pipeline } = await import('@xenova/transformers');
+            // 使用 text-classification pipeline，这是 cross-encoder 的正确用法
+            rerankerPipeline = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2');
+            console.log('RAG: Cross-encoder model loaded successfully');
+        } catch (e) {
+            console.log('RAG: Failed to load cross-encoder model:', e);
+            rerankerPipeline = null;
+        } finally {
+            rerankerLoading = false;
+        }
+    }
+
+    // 使用交叉编码器计算查询和文档的相关性分数
+    private async computeRerankScore(question: string, text: string): Promise<number> {
+        if (!rerankerPipeline) {
+            await this.loadReranker();
+        }
+        if (!rerankerPipeline) {
+            return 0;
+        }
+
+        try {
+            // 对于 text-classification pipeline，输入格式为 "query [SEP] document"
+            const input = `${question} [SEP] ${text.substring(0, 512)}`; // 限制长度避免过长
+            const output = await rerankerPipeline(input);
+
+            // text-classification 输出包含 label 和 score
+            // 对于二分类模型，score 表示相关性分数
+            if (Array.isArray(output) && output.length > 0) {
+                const result = output[0];
+                if (result && typeof result.score === 'number') {
+                    return result.score;
+                }
+            }
+            return 0;
+        } catch (e) {
+            console.log('RAG: Error computing rerank score:', e);
+            return 0;
+        }
+    }
+
+    // rerank候选文档，使用交叉编码器选出最相关的top k个
+    private async rerankDocs(question: string, candidates: Array<{chunk: DocChunk, rrfScore: number, rankVector?: number, rankKeyword?: number}>): Promise<Array<{chunk: DocChunk, rerankScore: number, rankVector?: number, rankKeyword?: number}>> {
+        if (candidates.length <= RERANK_TOP_K) {
+            return candidates.map(c => ({ chunk: c.chunk, rerankScore: c.rrfScore, rankVector: c.rankVector, rankKeyword: c.rankKeyword }));
+        }
+
+        try {
+            // 使用交叉编码器计算每个候选的相关性分数
+            const scoredCandidates = await Promise.all(
+                candidates.map(async (candidate) => {
+                    const score = await this.computeRerankScore(question, candidate.chunk.content);
+                    return { ...candidate, rerankScore: score };
+                })
+            );
+
+            // 按交叉编码器分数排序，取top k
+            return scoredCandidates
+                .sort((a, b) => b.rerankScore - a.rerankScore)
+                .slice(0, RERANK_TOP_K);
+        } catch (e) {
+            console.log('RAG: Rerank failed, using RRF top results');
+            return candidates.slice(0, RERANK_TOP_K).map(c => ({
+                chunk: c.chunk,
+                rerankScore: c.rrfScore,
+                rankVector: c.rankVector,
+                rankKeyword: c.rankKeyword
+            }));
+        }
     }
 
     // 提取关键词（使用jieba分词+停用词过滤）
