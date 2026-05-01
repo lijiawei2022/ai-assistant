@@ -11,6 +11,8 @@ const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'nomic-embed-text';
 const CHUNK_SIZE = 500;
 const CHUNK_OVERLAP = 50;  // 递归分块重叠大小
+const CACHE_DIR_NAME = 'documents_xiangliang';
+const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
 // RRF标准实现无需阈值，仅按融合分数排序取Top N
 const VECTOR_THRESHOLD = 0.6;    // 向量检索预过滤阈值（按最初要求）
 const KEYWORD_MIN_MATCH = 1;       // 关键词检索最小匹配数（避免单关键词误匹配）
@@ -164,14 +166,31 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    // 加载文档并生成向量
+    // 获取缓存目录路径
+    private getCacheDir(): string {
+        const cacheDir = path.join(this._context.extensionPath, CACHE_DIR_NAME);
+        if (!fs.existsSync(cacheDir)) {
+            fs.mkdirSync(cacheDir, { recursive: true });
+        }
+        return cacheDir;
+    }
+
+    // 计算单个文件的哈希（基于大小和修改时间）
+    private getFileHash(filePath: string): string {
+        const crypto = require('crypto');
+        const stats = fs.statSync(filePath);
+        const hash = crypto.createHash('md5');
+        hash.update(`${path.basename(filePath)}_${stats.size}_${stats.mtimeMs}`);
+        return hash.digest('hex');
+    }
+
+    // 加载文档并生成向量（支持增量缓存）
     private async loadDocumentsWithEmbeddings(): Promise<void> {
         if (docsLoaded) {
             return;
         }
 
         try {
-            // 始终使用扩展所在目录查找documents文件夹（documents随扩展安装）
             const documentsPath = path.join(this._context.extensionPath, 'documents');
             console.log(`RAG: Documents path: ${documentsPath}`);
 
@@ -181,41 +200,86 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
-            const files = fs.readdirSync(documentsPath);
+            const cacheDir = this.getCacheDir();
+            const files = fs.readdirSync(documentsPath).filter(f => {
+                const ext = path.extname(f).toLowerCase();
+                return ext === '.txt' || ext === '.md';
+            });
+
             let totalChunks = 0;
-            
+            const newDocChunks: DocChunk[] = [];
+
             for (const file of files) {
-                const ext = path.extname(file).toLowerCase();
-                if (ext !== '.txt' && ext !== '.md') {
-                    console.log(`RAG: Skipping unsupported file: ${file}`);
-                    continue;
+                const filePath = path.join(documentsPath, file);
+                const fileHash = this.getFileHash(filePath);
+                const cacheFile = path.join(cacheDir, `${file}.json`);
+
+                // 尝试从缓存加载该文件
+                if (fs.existsSync(cacheFile)) {
+                    try {
+                        const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+                        if (cacheData.hash === fileHash && Array.isArray(cacheData.chunks)) {
+                            newDocChunks.push(...cacheData.chunks);
+                            totalChunks += cacheData.chunks.length;
+                            console.log(`RAG: Loaded ${file} from cache (${cacheData.chunks.length} chunks)`);
+                            continue;
+                        }
+                    } catch (e) {
+                        console.log(`RAG: Cache read failed for ${file}, regenerating...`);
+                    }
                 }
 
-                const filePath = path.join(documentsPath, file);
+                // 缓存不存在或无效，生成向量
                 const content = fs.readFileSync(filePath, 'utf-8');
                 console.log(`RAG: Processing file: ${file}, content length: ${content.length}`);
-                
-                // 使用LangChain的RecursiveCharacterTextSplitter
+
                 const splitter = new RecursiveCharacterTextSplitter({
                     chunkSize: CHUNK_SIZE,
                     chunkOverlap: CHUNK_OVERLAP,
                 });
                 const chunks = await splitter.splitText(content);
                 console.log(`RAG: File ${file} split into ${chunks.length} chunks`);
-                
+
+                const fileChunks: DocChunk[] = [];
                 for (const chunkContent of chunks) {
                     const embedding = await this.generateEmbedding(chunkContent);
                     if (embedding.length > 0) {
-                        docChunks.push({ fileName: file, content: chunkContent, embedding });
+                        const docChunk = { fileName: file, content: chunkContent, embedding };
+                        fileChunks.push(docChunk);
+                        newDocChunks.push(docChunk);
                         totalChunks++;
                     } else {
                         console.log(`RAG: Failed to generate embedding for chunk (length: ${chunkContent.length})`);
                     }
                 }
+
+                // 保存该文件的缓存
+                try {
+                    const cacheData = {
+                        hash: fileHash,
+                        chunks: fileChunks,
+                        timestamp: Date.now()
+                    };
+                    fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2));
+                    console.log(`RAG: Saved ${file} to cache`);
+                } catch (e) {
+                    console.log(`RAG: Failed to save cache for ${file}`);
+                }
             }
 
+            // 清理已删除文件的缓存
+            const cacheFiles = fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'));
+            for (const cacheFile of cacheFiles) {
+                const fileName = cacheFile.replace('.json', '');
+                if (!files.includes(fileName)) {
+                    fs.unlinkSync(path.join(cacheDir, cacheFile));
+                    console.log(`RAG: Removed cache for deleted file: ${fileName}`);
+                }
+            }
+
+            docChunks = newDocChunks;
             docsLoaded = true;
-            console.log(`RAG: Loaded ${totalChunks} document chunks from ${files.length} files`);
+            console.log(`RAG: Loaded ${totalChunks} document chunks from ${files.length} files (with incremental cache)`);
         } catch (error) {
             console.error('RAG: Failed to load documents', error);
             docsLoaded = true;
