@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as nodejieba from 'nodejieba';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
 // 配置
@@ -452,33 +453,69 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         return { contextText, fileNames, retrievalDetails };
     }
 
-    // 提取关键词（支持中英文）
-    private extractKeywords(text: string): string[] {
-        const lowerText = text.toLowerCase();
-        const keywords: string[] = [];
-        
-        // 提取英文单词（长度>=2）
-        const englishWords = lowerText.match(/[a-z]{2,}/g) || [];
-        keywords.push(...englishWords);
-        
-        // 提取中文：所有2字以上连续子串（解决长句无法拆分问题）
-        const chineseSegments = lowerText.match(/[\u4e00-\u9fa5]+/g) || [];
-        for (const segment of chineseSegments) {
-            // 生成所有可能的2字以上子串
-            for (let i = 0; i < segment.length; i++) {
-                for (let j = i + 1; j < segment.length; j++) {
-                    const substr = segment.substring(i, j + 1);
-                    if (substr.length >= 2) {
-                        keywords.push(substr);
-                    } else {
-                        break;
+    // 停用词集合
+    private stopWords: Set<string> | null = null;
+
+    // 加载停用词
+    private loadStopWords(): Set<string> {
+        if (this.stopWords !== null) {
+            return this.stopWords;
+        }
+
+        this.stopWords = new Set<string>();
+        try {
+            const stopWordsPath = path.join(this._context.extensionPath, 'stopwords.txt');
+            if (fs.existsSync(stopWordsPath)) {
+                const content = fs.readFileSync(stopWordsPath, 'utf-8');
+                const lines = content.split('\n');
+                for (const line of lines) {
+                    const word = line.trim();
+                    if (word && !word.startsWith('#')) {
+                        this.stopWords.add(word.toLowerCase());
                     }
+                }
+                console.log(`RAG: Loaded ${this.stopWords.size} stop words`);
+            }
+        } catch (e) {
+            console.log('RAG: Failed to load stop words, using empty set');
+        }
+        return this.stopWords;
+    }
+
+    // 提取关键词（使用jieba分词+停用词过滤）
+    private extractKeywords(text: string): string[] {
+        const keywords: Set<string> = new Set();
+        const stopWords = this.loadStopWords();
+
+        // 使用jieba分词处理中文
+        try {
+            const jiebaWords = nodejieba.cut(text, true); // 精确模式
+            for (const word of jiebaWords) {
+                const w = word.trim().toLowerCase();
+                if (w.length >= 2 && !stopWords.has(w) && !/^\d+$/.test(w)) {
+                    keywords.add(w);
+                }
+            }
+        } catch (e) {
+            console.log('RAG: jieba cut failed, fallback to simple extraction');
+            // 降级方案：简单提取中文词组
+            const chineseSegments = text.match(/[\u4e00-\u9fa5]+/g) || [];
+            for (const segment of chineseSegments) {
+                if (segment.length >= 2 && !stopWords.has(segment.toLowerCase())) {
+                    keywords.add(segment.toLowerCase());
                 }
             }
         }
-        
-        // 去重
-        return [...new Set(keywords)];
+
+        // 提取英文单词（长度>=2，过滤停用词）
+        const englishWords = text.toLowerCase().match(/[a-z]{2,}/g) || [];
+        for (const word of englishWords) {
+            if (!stopWords.has(word)) {
+                keywords.add(word);
+            }
+        }
+
+        return [...keywords];
     }
 
     private async handleAskQuestion(question: string, hasContext: boolean = false) {
