@@ -3,22 +3,23 @@ import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as nodejieba from 'nodejieba';
-import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
 // 配置
 const OLLAMA_URL = 'http://localhost:11434/api/chat';
 const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
 const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'bge-m3';
-const CHUNK_SIZE = 500;
-const CHUNK_OVERLAP = 50;  // 递归分块重叠大小
+const RERANKER_MODEL = 'bona/bge-reranker-v2-m3';
+const CHUNK_SIZE = 800;
+const CHUNK_OVERLAP = 200;
 const CACHE_DIR_NAME = 'documents_xiangliang';
 const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
 // 检索参数配置
 const VECTOR_THRESHOLD = 0.3;   // 向量检索预过滤阈值（余弦相似度，bge-m3分布较平，阈值可适当降低）
 const BM25_MIN_SCORE = 0.1;      // BM25最小分数阈值（过滤明显不相关的）
 const RRF_K = 60;                // RRF公式中的k值（标准值为60）
-const RRF_TOP_K = 30;            // RRF选出候选数
+const RRF_TOP_K = 10;            // RRF选出候选数（交叉编码器rerank开销大，10个候选足够）
 const RERANK_TOP_K = 5;          // rerank后最终返回数量
 
 // BM25参数
@@ -72,7 +73,7 @@ let docChunks: DocChunk[] = [];
 let docsLoaded = false;
 let modelConnected = false; // 大模型连接状态
 let initCompleted = false; // 初始化是否完成
-let llmRerankerReady = false;
+let rerankerReady = false;
 
 export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiAssistantView';
@@ -101,8 +102,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         modelConnected = modelOk;
 
         if (modelOk) {
-            llmRerankerReady = true;
-            console.log('RAG: LLM reranker ready (using ' + LLM_MODEL + ')');
+            rerankerReady = true;
+            console.log('RAG: Reranker ready (using ' + RERANKER_MODEL + ')');
         }
 
         initCompleted = true;
@@ -294,7 +295,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 if (fs.existsSync(cacheFile)) {
                     try {
                         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
-                        if (cacheData.hash === fileHash && cacheData.embedModel === EMBED_MODEL && Array.isArray(cacheData.chunks)) {
+                        if (cacheData.hash === fileHash && cacheData.embedModel === EMBED_MODEL && cacheData.chunkSize === CHUNK_SIZE && cacheData.chunkOverlap === CHUNK_OVERLAP && Array.isArray(cacheData.chunks)) {
                             newDocChunks.push(...cacheData.chunks);
                             totalChunks += cacheData.chunks.length;
                             console.log(`RAG: Loaded ${file} from cache (${cacheData.chunks.length} chunks)`);
@@ -309,10 +310,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 const content = fs.readFileSync(filePath, 'utf-8');
                 console.log(`RAG: Processing file: ${file}, content length: ${content.length}`);
 
-                const splitter = new RecursiveCharacterTextSplitter({
-                    chunkSize: CHUNK_SIZE,
-                    chunkOverlap: CHUNK_OVERLAP,
-                });
+                const isMarkdown = file.toLowerCase().endsWith('.md');
+                const splitter = isMarkdown
+                    ? new MarkdownTextSplitter({ chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP })
+                    : new RecursiveCharacterTextSplitter({ chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP });
                 const chunks = await splitter.splitText(content);
                 console.log(`RAG: File ${file} split into ${chunks.length} chunks`);
 
@@ -334,6 +335,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     const cacheData = {
                         hash: fileHash,
                         embedModel: EMBED_MODEL,
+                        chunkSize: CHUNK_SIZE,
+                        chunkOverlap: CHUNK_OVERLAP,
                         chunks: fileChunks,
                         timestamp: Date.now()
                     };
@@ -670,76 +673,47 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         return score;
     }
 
-    private async llmRerankScores(question: string, candidates: Array<{chunk: DocChunk, rrfScore: number}>): Promise<Map<number, number>> {
-        const scoreMap = new Map<number, number>();
+    private async crossEncoderScore(question: string, document: string): Promise<number> {
+        return new Promise((resolve) => {
+            try {
+                const input = `${question} [SEP] ${document.substring(0, 512)}`;
+                const body = JSON.stringify({
+                    model: RERANKER_MODEL,
+                    prompt: input
+                });
 
-        if (!llmRerankerReady || candidates.length === 0) {
-            return scoreMap;
-        }
-
-        const docList = candidates.map((c, i) => `[${i + 1}] ${c.chunk.content.substring(0, 300)}`).join('\n\n');
-
-        const prompt = `请对以下文档片段与查询问题的相关性打分（0-10分，10分最相关，0分无关）。
-只输出编号和分数，每行一个，格式如：1:8
-
-查询问题：${question}
-
-文档片段：
-${docList}
-
-请直接输出打分结果：`;
-
-        try {
-            const body = JSON.stringify({
-                model: LLM_MODEL,
-                messages: [{ role: 'user', content: prompt }],
-                stream: false,
-                options: { temperature: 0.1, num_predict: 512 }
-            });
-
-            const response = await new Promise<string>((resolve) => {
                 cp.execFile('curl', [
                     '-s', '-X', 'POST',
-                    OLLAMA_URL,
+                    OLLAMA_EMBED_URL,
                     '-H', 'Content-Type: application/json',
                     '-d', body
-                ], { timeout: 30000 }, (error, stdout) => {
+                ], { timeout: 120000 }, (error, stdout) => {
                     if (error) {
-                        console.log('RAG: LLM rerank request failed:', error.message);
-                        resolve('');
+                        console.log('RAG: Cross-encoder request failed:', error.message);
+                        resolve(0);
                         return;
                     }
                     try {
                         const data = JSON.parse(stdout);
-                        resolve(data.message?.content || '');
+                        const embedding: number[] = data.embedding || [];
+                        if (embedding.length === 0) {
+                            resolve(0);
+                            return;
+                        }
+                        let normSq = 0;
+                        for (const v of embedding) {
+                            normSq += v * v;
+                        }
+                        resolve(Math.sqrt(normSq));
                     } catch (e) {
-                        resolve('');
+                        console.log('RAG: Cross-encoder parse error:', stdout?.substring(0, 200));
+                        resolve(0);
                     }
                 });
-            });
-
-            if (!response) {
-                return scoreMap;
+            } catch (e) {
+                resolve(0);
             }
-
-            const lines = response.split('\n');
-            for (const line of lines) {
-                const match = line.trim().match(/^(\d+)\s*[:：]\s*(\d+(?:\.\d+)?)/);
-                if (match) {
-                    const idx = parseInt(match[1]) - 1;
-                    const score = parseFloat(match[2]);
-                    if (idx >= 0 && idx < candidates.length && !isNaN(score)) {
-                        scoreMap.set(idx, Math.min(10, Math.max(0, score)) / 10);
-                    }
-                }
-            }
-
-            console.log(`RAG: LLM rerank scored ${scoreMap.size}/${candidates.length} candidates`);
-        } catch (e) {
-            console.log('RAG: LLM rerank failed:', e);
-        }
-
-        return scoreMap;
+        });
     }
 
     private async rerankDocs(question: string, candidates: Array<{chunk: DocChunk, rrfScore: number, rankVector?: number, rankKeyword?: number}>): Promise<Array<{chunk: DocChunk, rerankScore: number, rankVector?: number, rankKeyword?: number}>> {
@@ -747,34 +721,45 @@ ${docList}
             return candidates.map(c => ({ chunk: c.chunk, rerankScore: c.rrfScore, rankVector: c.rankVector, rankKeyword: c.rankKeyword }));
         }
 
-        try {
-            const scoreMap = await this.llmRerankScores(question, candidates);
+        if (!rerankerReady) {
+            return candidates.slice(0, RERANK_TOP_K).map(c => ({
+                chunk: c.chunk,
+                rerankScore: c.rrfScore,
+                rankVector: c.rankVector,
+                rankKeyword: c.rankKeyword
+            }));
+        }
 
-            if (scoreMap.size < Math.min(3, candidates.length)) {
-                console.log('RAG: LLM rerank returned too few scores, falling back to RRF');
-                return candidates.slice(0, RERANK_TOP_K).map(c => ({
-                    chunk: c.chunk,
-                    rerankScore: c.rrfScore,
-                    rankVector: c.rankVector,
-                    rankKeyword: c.rankKeyword
-                }));
+        try {
+            console.log(`RAG: Cross-encoder reranking ${candidates.length} candidates...`);
+
+            const scores = await Promise.all(
+                candidates.map(candidate => this.crossEncoderScore(question, candidate.chunk.content))
+            );
+
+            let maxScore = -Infinity;
+            let minScore = Infinity;
+            for (const s of scores) {
+                if (s > maxScore) maxScore = s;
+                if (s < minScore) minScore = s;
             }
+            const scoreRange = maxScore - minScore || 1;
 
             const scoredCandidates = candidates.map((candidate, idx) => {
-                const llmScore = scoreMap.get(idx);
+                const normalizedScore = (scores[idx] - minScore) / scoreRange;
                 return {
                     ...candidate,
-                    rerankScore: llmScore !== undefined
-                        ? llmScore * 0.7 + (candidate.rrfScore / (candidates[0]?.rrfScore || 1)) * 0.3
-                        : candidate.rrfScore * 0.5
+                    rerankScore: normalizedScore * 0.8 + (candidate.rrfScore / (candidates[0]?.rrfScore || 1)) * 0.2
                 };
             });
+
+            console.log(`RAG: Cross-encoder rerank scores range: ${minScore.toFixed(2)} ~ ${maxScore.toFixed(2)}`);
 
             return scoredCandidates
                 .sort((a, b) => b.rerankScore - a.rerankScore)
                 .slice(0, RERANK_TOP_K);
         } catch (e) {
-            console.log('RAG: Rerank failed, using RRF top results');
+            console.log('RAG: Cross-encoder rerank failed, using RRF top results');
             return candidates.slice(0, RERANK_TOP_K).map(c => ({
                 chunk: c.chunk,
                 rerankScore: c.rrfScore,
