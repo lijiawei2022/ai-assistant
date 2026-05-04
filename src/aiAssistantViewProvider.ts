@@ -121,8 +121,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     // 初始化：加载文档向量 + 检查大模型连接 + 加载reranker
     private async initialize(): Promise<void> {
         const startTime = Date.now();
-        console.log('[RAG] ═══════════════════════════════');
-        console.log('[RAG]  初始化开始');
+        console.log('[RAG]初始化开始');
 
         const [modelOk] = await Promise.all([
             this.checkModelConnection(),
@@ -131,11 +130,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         modelConnected = modelOk;
 
-        console.log(`[RAG] ${modelOk ? '✓' : '✗'} 模型连接: ${LLM_MODEL} ${modelOk ? '(OK)' : '(失败)'}`);
+        console.log(`[LLM]模型连接: ${LLM_MODEL} ${modelOk ? '--success' : '--fail'}`);
 
-        if (modelOk) {
-            this.loadReranker();
-        }
+        await this.loadReranker();
 
         initCompleted = true;
 
@@ -149,9 +146,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[RAG] ═══════════════════════════════`);
-        console.log(`[RAG]  初始化完成 [${docChunks.length} chunks | Model ${modelConnected ? 'OK' : '--'} | Reranker ${rerankerReady ? 'OK' : '--'}] ${elapsed}s`);
-        console.log(`[RAG] ═══════════════════════════════`);
+        console.log(`[RAG]初始化完成 [Model ${modelConnected ? 'OK' : '--'} | ${docChunks.length} chunks | Reranker ${rerankerReady ? 'OK' : '--'}] ${elapsed}s`);
     }
 
     // 检查大模型连接
@@ -202,9 +197,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             rerankerModel = model;
             rerankerTokenizer = tokenizer;
             rerankerReady = true;
-            console.log(`[RAG] ✓ Reranker: ${RERANKER_MODEL} (${sourceLabel})`);
+            console.log(`[RAG]Reranker: ${RERANKER_MODEL} (${sourceLabel})--success`);
         } catch (e) {
-            console.log(`[RAG] ✗ Reranker 加载失败: ${(e as Error).message}`);
+            console.log(`[RAG]Reranker 加载失败: ${(e as Error).message}--fail`);
             rerankerReady = false;
         }
     }
@@ -316,7 +311,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const documentsPath = path.join(this._context.extensionPath, 'documents');
 
             if (!fs.existsSync(documentsPath)) {
-                console.log(`[RAG] ✗ 文档目录不存在: ${documentsPath}`);
+                console.log(`[RAG]文档目录不存在: ${documentsPath}--fail`);
                 docsLoaded = true;
                 return;
             }
@@ -328,12 +323,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             });
 
             if (files.length === 0) {
-                console.log('[RAG] ✗ 文档目录为空 (无 .txt/.md 文件)');
+                console.log('[RAG]文档目录为空 (无 .txt/.md 文件)--fail');
                 docsLoaded = true;
                 return;
             }
 
             console.log(`[RAG]   文档目录: ${documentsPath} (${files.length} files)`);
+            console.log(`[RAG]   开始进行向量生成`);
 
             let totalChunks = 0;
             let cachedCount = 0;
@@ -413,9 +409,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const summary = cachedCount > 0 && generatedCount > 0
                 ? `${cachedCount}缓存+${generatedCount}生成`
                 : cachedCount > 0 ? `${cachedCount}缓存` : `${generatedCount}生成`;
-            console.log(`[RAG] ✓ 向量索引: ${totalChunks} chunks | embed=${EMBED_MODEL} (${summary})`);
+            console.log(`[RAG]向量索引: ${totalChunks} chunks | embed=${EMBED_MODEL} (${summary})--success`);
         } catch (error) {
-            console.error('[RAG] ✗ 文档加载失败', error);
+            console.error('[RAG]文档加载失败--fail', error);
             docsLoaded = true;
         }
     }
@@ -434,7 +430,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                         await new Promise(r => setTimeout(r, 1000));
                         return attempt(remainingRetries - 1);
                     }
-                    console.log(`[RAG] ✗ Embedding 返回空 (重试已耗尽)`);
+                    console.log(`[RAG]Embedding 返回空 (重试已耗尽)--fail`);
                     return [];
                 }
                 return embedding;
@@ -443,7 +439,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     await new Promise(r => setTimeout(r, 1000));
                     return attempt(remainingRetries - 1);
                 }
-                console.log(`[RAG] ✗ Embedding 失败 (重试已耗尽): ${(e as Error).message}`);
+                console.log(`[RAG]Embedding 失败 (重试已耗尽): ${(e as Error).message}--fail`);
                 return [];
             }
         };
@@ -658,7 +654,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.totalDocs = docChunks.length;
         this.avgdl = totalLength / this.totalDocs;
         this.bm25Ready = true;
-        console.log(`[RAG] ✓ BM25 索引: ${this.totalDocs} docs, avgdl=${this.avgdl.toFixed(1)} | 停用词=${stopWords.size}`);
+        console.log(`[RAG]BM25索引: ${this.totalDocs} docs, avgdl=${this.avgdl.toFixed(1)} | 停用词=${stopWords.size}--success`);
     }
 
     // 计算标准BM25分数
