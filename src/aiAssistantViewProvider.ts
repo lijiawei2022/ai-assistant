@@ -68,28 +68,29 @@ function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<an
 const SYSTEM_PROMPT = `你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。
 
 ## 角色定位
-- 资深程序员与计算机科学导师
-- 熟悉C语言等主流编程语言
-- 精通数据结构、算法、软件工程等核心知识
+资深程序员与计算机科学导师
+熟悉C语言等主流编程语言
+精通数据结构、算法、软件工程等核心知识
 
 ## 核心能力
-1. **代码分析**：审查代码语法、逻辑、性能问题
-2. **错误诊断**：定位并解释编译错误、运行时错误、逻辑错误
-3. **概念讲解**：清晰解释语法特性、算法原理、设计模式
-4. **调试指导**：提供调试思路、工具和技巧
-5. **最佳实践**：推荐代码规范、优化方案和工程经验
+代码分析：审查代码语法、逻辑、性能问题
+错误诊断：定位并解释编译错误、运行时错误、逻辑错误
+概念讲解：清晰解释语法特性、算法原理、设计模式
+调试指导：提供调试思路、工具和技巧
+最佳实践：推荐代码规范、优化方案和工程经验
 
 ## 回答原则
-- **简洁精准**：直接回答核心问题，避免冗余解释
-- **知识库优先**：优先依据知识库内容作答，知识库不足时基于专业知识回答
-- **因材施教**：根据问题难度调整讲解深度，新手侧重基础，进阶者侧重原理
-- **代码示例**：必要时提供完整可运行的代码示例（用代码块包裹）
-- **中文为主**：使用简洁中文，专业术语保留英文原文
+用户提问的格式是固定的，包含用户问题，参考文档，用户提供的代码三个部分。你的回答不限制格式但有以下要求，
+简洁精准：直接回答核心问题，避免冗余解释
+结合代码：当用户提供的代码不为空时，可能需要结合代码分析问题
+知识库优先：当参考文档不为空时，如果与问题强相关优先依据参考文档内容作答，参考文档不足或不相关时基于专业知识回答
+因材施教：根据问题难度调整讲解深度，新手侧重基础，进阶者侧重原理
+代码示例：必要时提供完整可运行的代码示例（用代码块包裹）
+中文为主：使用简洁中文，专业术语保留英文原文
 
 ## 交互方式
-- 理解用户意图：区分代码审查、概念咨询、错误排查等场景
-- 灵活处理输入：支持代码片段、完整程序、错误信息、概念问题等多种格式
-- 保持上下文：在多轮对话中记住之前的讨论内容`;
+理解用户意图：区分代码审查、概念咨询、错误排查等场景
+灵活处理输入：支持代码片段、完整程序、错误信息、概念问题等多种格式`;
 
 interface DocChunk {
     fileName: string;
@@ -276,6 +277,16 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         // 移除历史中可能存在的旧系统消息，插入最新的系统提示到最前
         const messagesWithoutSystem = messages.filter(m => m.role !== 'system');
         const finalMessages = [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messagesWithoutSystem];
+
+        console.log('[LLM] ═══════════════════════════════');
+        console.log(`[LLM] 发送消息数: ${finalMessages.length}`);
+        for (let i = 0; i < finalMessages.length; i++) {
+            const msg = finalMessages[i];
+            console.log(`[LLM] [${i}] role=${msg.role} | 长度=${msg.content.length}`);
+            console.log(msg.content);
+            console.log('---');
+        }
+        console.log('[LLM] ═══════════════════════════════');
 
         try {
             const data = await ollamaRequest(OLLAMA_URL, {
@@ -551,11 +562,15 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         const fileNames = [...new Set(rerankedResults.map(r => r.chunk.fileName))];
-        let contextText = '以下是知识库中相关的内容，请根据这些内容回答问题。\n\n知识库内容：\n';
+        let contextText = '参考文档：';
         const retrievalDetails: RetrievalResult[] = [];
 
-        for (const result of rerankedResults) {
-            contextText += `\n【文件: ${result.chunk.fileName}】\n\`\`\`\n${result.chunk.content}\n\`\`\`\n---\n`;
+        for (let i = 0; i < rerankedResults.length; i++) {
+            const result = rerankedResults[i];
+            if (i > 0 && i % 2 === 0) {
+                contextText += '\n';
+            }
+            contextText += `\n${result.chunk.content}`;
             const originalRrfScore = rrfScoreMap.get(result.chunk) || result.rerankScore;
             retrievalDetails.push({
                 fileName: result.chunk.fileName,
@@ -832,30 +847,35 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const ragResult = await this.retrieveRelevantDocs(question);
             const hasRagDocs = ragResult.fileNames.length > 0;
             
-            // 构造用户消息内容（系统提示已在callOllama中注入，无需重复）
-            let userContent = '';
+            // 构造存入历史的用户消息（不含RAG文档，避免历史膨胀）
+            let historyContent = `用户问题：${question}`;
 
-            if (hasRagDocs) {
-                // 有知识库文档：根据文档+问题+对话历史回答
-                userContent = `${ragResult.contextText}\n用户问题：${question}`;
-            } else {
-                // 无知识库文档：直接根据问题+对话历史回答
-                userContent = `用户问题：${question}`;
-            }
-            
-            // 如果有选中代码，始终拼接（不再限制格式和关键词）
             if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
                 const ctx = AiAssistantViewProvider.selectedCodeContext;
-                userContent += `\n\n附：相关代码\n文件: ${ctx.fileName}\n语言: ${ctx.language}\n\`\`\`${ctx.language}\n${ctx.code}\n\`\`\``;
-                // 拼接后清空，避免下次问题继续携带
+                historyContent += `\n\n用户提供的代码：\n${ctx.code}`;
                 AiAssistantViewProvider.selectedCodeContext = null;
+            } else {
+                historyContent += '\n\n用户提供的代码：空';
             }
 
-            // 用户消息加入历史
-            this.conversationHistory.push({ role: 'user', content: userContent });
+            this.conversationHistory.push({ role: 'user', content: historyContent });
 
-            // 传入完整历史调用大模型
-            const rawAnswer = await this.callOllama(this.conversationHistory);
+            // 构造发送给大模型的消息（在最后一条用户消息后注入RAG文档）
+            const messagesForLLM = [...this.conversationHistory];
+            const lastIdx = messagesForLLM.length - 1;
+            if (hasRagDocs) {
+                messagesForLLM[lastIdx] = {
+                    ...messagesForLLM[lastIdx],
+                    content: `${historyContent}\n\n${ragResult.contextText}`
+                };
+            } else {
+                messagesForLLM[lastIdx] = {
+                    ...messagesForLLM[lastIdx],
+                    content: `${historyContent}\n\n参考文档：空`
+                };
+            }
+
+            const rawAnswer = await this.callOllama(messagesForLLM);
 
             // 先把大模型原始回答存入历史（不含手动拼接的来源说明，避免历史污染）
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
@@ -863,9 +883,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             // 拼接来源说明，仅用于前端展示，不进历史
             let finalAnswer = rawAnswer;
             if (hasRagDocs) {
-                finalAnswer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}，本地大模型根据相关文档回答`;
+                finalAnswer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}`;
             } else {
-                finalAnswer += `\n\n知识库中无相关文档，本地大模型直接回答`;
+                finalAnswer += `\n\n知识库中无相关文档`;
             }
 
             // 发送最终回答给前端（包含检索详情）
