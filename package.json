@@ -31,8 +31,17 @@
         "title": "AI Assistant: Analyze Selected Code"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiAssistant",
+          "title": "AI Assistant",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "aiAssistant": [
         {
           "type": "webview",
           "id": "aiAssistantView",
