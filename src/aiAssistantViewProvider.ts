@@ -6,9 +6,9 @@ import * as nodejieba from 'nodejieba';
 import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
 // 配置
-const OLLAMA_URL = 'http://localhost:11434/api/chat';
+const LLM_URL = 'http://localhost:8000/api/chat';
 const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
-const LLM_MODEL = 'qwen2.5-coder:3b';
+const LLM_MODEL = 'huggingface-serve';
 const EMBED_MODEL = 'bge-m3';
 const RERANKER_MODEL = 'Xenova/bge-reranker-base';
 const CHUNK_SIZE = 800;
@@ -152,7 +152,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     // 检查大模型连接
     private async checkModelConnection(): Promise<boolean> {
         try {
-            const data = await ollamaRequest(OLLAMA_URL, {
+            const data = await ollamaRequest(LLM_URL, {
                 model: LLM_MODEL,
                 messages: [{ role: 'user', content: 'hi' }],
                 stream: false
@@ -272,7 +272,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         console.log('[LLM] ═══════════════════════════════');
 
         try {
-            const data = await ollamaRequest(OLLAMA_URL, {
+            const data = await ollamaRequest(LLM_URL, {
                 model: LLM_MODEL,
                 messages: finalMessages,
                 stream: false
