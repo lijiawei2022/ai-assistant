@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { AiAssistantViewProvider } from './aiAssistantViewProvider';
 
 export function activate(context: vscode.ExtensionContext) {
-    console.log('AI Assistant Plugin is now active!');
+    console.log('[AI Assistant] 插件已激活');
 
     // Register the helloWorld command
     let helloWorld = vscode.commands.registerCommand('ai-assitant.helloWorld', () => {

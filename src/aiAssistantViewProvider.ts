@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import * as cp from 'child_process';
+import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as nodejieba from 'nodejieba';
@@ -26,6 +26,43 @@ const RERANK_TOP_K = 5;          // rerank后最终返回数量
 // BM25参数
 const BM25_K1 = 1.5;              // 词频饱和参数（标准值1.2-2.0）
 const BM25_B = 0.75;              // 文档长度归一化参数（标准值0.75）
+
+function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<any> {
+    return new Promise((resolve, reject) => {
+        const bodyStr = JSON.stringify(body);
+        const parsed = new URL(url);
+
+        const options: http.RequestOptions = {
+            hostname: parsed.hostname,
+            port: parsed.port,
+            path: parsed.pathname,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(bodyStr)
+            },
+            timeout: timeoutMs
+        };
+
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk: string) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(data));
+                } catch {
+                    reject(new Error(`Invalid JSON response: ${data.substring(0, 200)}`));
+                }
+            });
+        });
+
+        req.on('error', (err: Error) => reject(err));
+        req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+
+        req.write(bodyStr);
+        req.end();
+    });
+}
 
 // 系统设计提示词：面向程序设计领域的AI助教
 const SYSTEM_PROMPT = `你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。
@@ -94,7 +131,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
     // 初始化：加载文档向量 + 检查大模型连接 + 加载reranker
     private async initialize(): Promise<void> {
-        console.log('RAG: Starting initialization...');
+        const startTime = Date.now();
+        console.log('[RAG] ═══════════════════════════════');
+        console.log('[RAG]  初始化开始');
 
         const [modelOk] = await Promise.all([
             this.checkModelConnection(),
@@ -102,6 +141,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         ]);
 
         modelConnected = modelOk;
+
+        console.log(`[RAG] ${modelOk ? '✓' : '✗'} 模型连接: ${LLM_MODEL} ${modelOk ? '(OK)' : '(失败)'}`);
 
         if (modelOk) {
             this.loadReranker();
@@ -118,41 +159,24 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             });
         }
 
-        console.log(`RAG: Initialization complete. Model: ${modelConnected ? 'OK' : 'Failed'}, Docs: ${docChunks.length} chunks`);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`[RAG] ═══════════════════════════════`);
+        console.log(`[RAG]  初始化完成 [${docChunks.length} chunks | Model ${modelConnected ? 'OK' : '--'} | Reranker ${rerankerReady ? 'OK' : '--'}] ${elapsed}s`);
+        console.log(`[RAG] ═══════════════════════════════`);
     }
 
     // 检查大模型连接
     private async checkModelConnection(): Promise<boolean> {
-        return new Promise((resolve) => {
-            try {
-                const body = JSON.stringify({
-                    model: LLM_MODEL,
-                    messages: [{ role: 'user', content: 'hi' }],
-                    stream: false
-                });
-
-                cp.execFile('curl', [
-                    '-s', '-X', 'POST',
-                    OLLAMA_URL,
-                    '-H', 'Content-Type: application/json',
-                    '-d', body
-                ], { timeout: 10000 }, (error, stdout) => {
-                    if (error) {
-                        console.log('RAG: Model connection failed:', error.message);
-                        resolve(false);
-                        return;
-                    }
-                    try {
-                        const data = JSON.parse(stdout);
-                        resolve(!!data.message?.content);
-                    } catch (e) {
-                        resolve(false);
-                    }
-                });
-            } catch (e) {
-                resolve(false);
-            }
-        });
+        try {
+            const data = await ollamaRequest(OLLAMA_URL, {
+                model: LLM_MODEL,
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: false
+            }, 10000);
+            return !!data.message?.content;
+        } catch {
+            return false;
+        }
     }
 
     private async loadReranker(): Promise<void> {
@@ -173,24 +197,15 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
             const cachedModelDir = path.join(modelCacheDir, RERANKER_MODEL);
             const isCached = fs.existsSync(path.join(cachedModelDir, 'onnx'));
+            const sourceLabel = isCached ? '本地缓存' : '下载(hf-mirror)';
 
             if (!isCached) {
                 transformers.env.remoteHost = 'https://hf-mirror.com/';
-                console.log(`RAG: Model not cached, downloading from hf-mirror.com...`);
-            } else {
-                console.log(`RAG: Model found in cache, loading locally...`);
             }
-
-            console.log(`RAG: Loading reranker model ${RERANKER_MODEL}...`);
 
             const [model, tokenizer] = await Promise.all([
                 transformers.AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL, {
-                    quantized: true,
-                    progress_callback: (progress: { status: string; file?: string; progress?: number }) => {
-                        if (progress.status === 'progress' && progress.file) {
-                            console.log(`RAG: Reranker download: ${progress.file} - ${progress.progress?.toFixed(1)}%`);
-                        }
-                    }
+                    quantized: true
                 }),
                 transformers.AutoTokenizer.from_pretrained(RERANKER_MODEL)
             ]);
@@ -198,9 +213,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             rerankerModel = model;
             rerankerTokenizer = tokenizer;
             rerankerReady = true;
-            console.log(`RAG: Reranker model ${RERANKER_MODEL} loaded successfully`);
+            console.log(`[RAG] ✓ Reranker: ${RERANKER_MODEL} (${sourceLabel})`);
         } catch (e) {
-            console.log('RAG: Failed to load reranker model:', (e as Error).message);
+            console.log(`[RAG] ✗ Reranker 加载失败: ${(e as Error).message}`);
             rerankerReady = false;
         }
     }
@@ -257,40 +272,21 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     // 调用 Ollama 多轮对话接口（自动注入系统提示到最前）
-    private callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
+    private async callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
         // 移除历史中可能存在的旧系统消息，插入最新的系统提示到最前
         const messagesWithoutSystem = messages.filter(m => m.role !== 'system');
         const finalMessages = [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messagesWithoutSystem];
 
-        return new Promise((resolve) => {
-            try {
-                const body = JSON.stringify({
-                    model: LLM_MODEL,
-                    messages: finalMessages,
-                    stream: false
-                });
-                
-                cp.execFile('curl', [
-                    '-s', '-X', 'POST',
-                    OLLAMA_URL,
-                    '-H', 'Content-Type: application/json',
-                    '-d', body
-                ], { timeout: 120000 }, (error, stdout) => {
-                    if (error) {
-                        resolve('调用大模型失败: ' + error.message);
-                        return;
-                    }
-                    try {
-                        const data = JSON.parse(stdout);
-                        resolve(data.message?.content || '未收到有效响应');
-                    } catch (e) {
-                        resolve('解析响应失败: ' + stdout.substring(0, 100));
-                    }
-                });
-            } catch (e) {
-                resolve('生成失败');
-            }
-        });
+        try {
+            const data = await ollamaRequest(OLLAMA_URL, {
+                model: LLM_MODEL,
+                messages: finalMessages,
+                stream: false
+            }, 120000);
+            return data.message?.content || '未收到有效响应';
+        } catch (e) {
+            return '调用大模型失败: ' + (e as Error).message;
+        }
     }
 
     // 获取缓存目录路径
@@ -319,10 +315,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         try {
             const documentsPath = path.join(this._context.extensionPath, 'documents');
-            console.log(`RAG: Documents path: ${documentsPath}`);
 
             if (!fs.existsSync(documentsPath)) {
-                console.log(`RAG: Documents folder not found: ${documentsPath}`);
+                console.log(`[RAG] ✗ 文档目录不存在: ${documentsPath}`);
                 docsLoaded = true;
                 return;
             }
@@ -333,7 +328,17 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 return ext === '.txt' || ext === '.md';
             });
 
+            if (files.length === 0) {
+                console.log('[RAG] ✗ 文档目录为空 (无 .txt/.md 文件)');
+                docsLoaded = true;
+                return;
+            }
+
+            console.log(`[RAG]   文档目录: ${documentsPath} (${files.length} files)`);
+
             let totalChunks = 0;
+            let cachedCount = 0;
+            let generatedCount = 0;
             const newDocChunks: DocChunk[] = [];
 
             for (const file of files) {
@@ -341,31 +346,27 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 const fileHash = this.getFileHash(filePath);
                 const cacheFile = path.join(cacheDir, `${file}.json`);
 
-                // 尝试从缓存加载该文件
                 if (fs.existsSync(cacheFile)) {
                     try {
                         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
                         if (cacheData.hash === fileHash && cacheData.embedModel === EMBED_MODEL && cacheData.chunkSize === CHUNK_SIZE && cacheData.chunkOverlap === CHUNK_OVERLAP && Array.isArray(cacheData.chunks)) {
                             newDocChunks.push(...cacheData.chunks);
                             totalChunks += cacheData.chunks.length;
-                            console.log(`RAG: Loaded ${file} from cache (${cacheData.chunks.length} chunks)`);
+                            cachedCount++;
+                            console.log(`[RAG]   ├─ ${file} → ${cacheData.chunks.length} chunks (缓存)`);
                             continue;
                         }
-                    } catch (e) {
-                        console.log(`RAG: Cache read failed for ${file}, regenerating...`);
+                    } catch {
+                        // 缓存损坏，重新生成
                     }
                 }
 
-                // 缓存不存在或无效，生成向量
                 const content = fs.readFileSync(filePath, 'utf-8');
-                console.log(`RAG: Processing file: ${file}, content length: ${content.length}`);
-
                 const isMarkdown = file.toLowerCase().endsWith('.md');
                 const splitter = isMarkdown
                     ? new MarkdownTextSplitter({ chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP })
                     : new RecursiveCharacterTextSplitter({ chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP });
                 const chunks = await splitter.splitText(content);
-                console.log(`RAG: File ${file} split into ${chunks.length} chunks`);
 
                 const fileChunks: DocChunk[] = [];
                 for (const chunkContent of chunks) {
@@ -375,12 +376,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                         fileChunks.push(docChunk);
                         newDocChunks.push(docChunk);
                         totalChunks++;
-                    } else {
-                        console.log(`RAG: Failed to generate embedding for chunk (length: ${chunkContent.length})`);
                     }
                 }
+                generatedCount++;
 
-                // 保存该文件的缓存
+                const label = chunks.length > 0 ? `${chunks.length} chunks (生成)` : '空文件';
+                console.log(`[RAG]   ├─ ${file} → ${label}`);
+
                 try {
                     const cacheData = {
                         hash: fileHash,
@@ -391,9 +393,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                         timestamp: Date.now()
                     };
                     fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2));
-                    console.log(`RAG: Saved ${file} to cache`);
-                } catch (e) {
-                    console.log(`RAG: Failed to save cache for ${file}`);
+                } catch {
+                    // 缓存写入失败不阻塞
                 }
             }
 
@@ -403,69 +404,51 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 const fileName = cacheFile.replace('.json', '');
                 if (!files.includes(fileName)) {
                     fs.unlinkSync(path.join(cacheDir, cacheFile));
-                    console.log(`RAG: Removed cache for deleted file: ${fileName}`);
                 }
             }
 
             docChunks = newDocChunks;
             this.buildBM25Index();
             docsLoaded = true;
-            console.log(`RAG: Loaded ${totalChunks} document chunks from ${files.length} files (with incremental cache)`);
+
+            const summary = cachedCount > 0 && generatedCount > 0
+                ? `${cachedCount}缓存+${generatedCount}生成`
+                : cachedCount > 0 ? `${cachedCount}缓存` : `${generatedCount}生成`;
+            console.log(`[RAG] ✓ 向量索引: ${totalChunks} chunks | embed=${EMBED_MODEL} (${summary})`);
         } catch (error) {
-            console.error('RAG: Failed to load documents', error);
+            console.error('[RAG] ✗ 文档加载失败', error);
             docsLoaded = true;
         }
     }
 
     // 生成向量
-    private generateEmbedding(text: string, retries: number = 2): Promise<number[]> {
-        return new Promise((resolve) => {
-            const attempt = (remainingRetries: number) => {
-                try {
-                    const body = JSON.stringify({
-                        model: EMBED_MODEL,
-                        prompt: text
-                    });
-                    
-                    cp.execFile('curl', [
-                        '-s', '-X', 'POST',
-                        OLLAMA_EMBED_URL,
-                        '-H', 'Content-Type: application/json',
-                        '-d', body
-                    ], { timeout: 120000 }, (error, stdout) => {
-                        if (error) {
-                            console.log(`RAG: Embedding error (retries left: ${remainingRetries}):`, error.message);
-                            if (remainingRetries > 0) {
-                                setTimeout(() => attempt(remainingRetries - 1), 1000);
-                            } else {
-                                resolve([]);
-                            }
-                            return;
-                        }
-                        try {
-                            const data = JSON.parse(stdout);
-                            const embedding = data.embedding || [];
-                            if (embedding.length === 0 && remainingRetries > 0) {
-                                console.log(`RAG: Empty embedding response, retrying...`);
-                                setTimeout(() => attempt(remainingRetries - 1), 1000);
-                            } else {
-                                resolve(embedding);
-                            }
-                        } catch (e) {
-                            console.log(`RAG: Embedding parse error (retries left: ${remainingRetries}):`, stdout?.substring(0, 200));
-                            if (remainingRetries > 0) {
-                                setTimeout(() => attempt(remainingRetries - 1), 1000);
-                            } else {
-                                resolve([]);
-                            }
-                        }
-                    });
-                } catch (e) {
-                    resolve([]);
+    private async generateEmbedding(text: string, retries: number = 2): Promise<number[]> {
+        const attempt = async (remainingRetries: number): Promise<number[]> => {
+            try {
+                const data = await ollamaRequest(OLLAMA_EMBED_URL, {
+                    model: EMBED_MODEL,
+                    prompt: text
+                }, 120000);
+                const embedding = data.embedding || [];
+                if (embedding.length === 0) {
+                    if (remainingRetries > 0) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        return attempt(remainingRetries - 1);
+                    }
+                    console.log(`[RAG] ✗ Embedding 返回空 (重试已耗尽)`);
+                    return [];
                 }
-            };
-            attempt(retries);
-        });
+                return embedding;
+            } catch (e) {
+                if (remainingRetries > 0) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    return attempt(remainingRetries - 1);
+                }
+                console.log(`[RAG] ✗ Embedding 失败 (重试已耗尽): ${(e as Error).message}`);
+                return [];
+            }
+        };
+        return attempt(retries);
     }
 
     // 余弦相似度
@@ -490,60 +473,52 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         fileNames: string[];
         retrievalDetails: RetrievalResult[];
     }> {
-        // 强制等待文档加载完成
         if (!docsLoaded) {
-            console.log('RAG: Waiting for documents to load...');
             await this.loadDocumentsWithEmbeddings();
-            console.log(`RAG: After load attempt, docsLoaded=${docsLoaded}, chunks=${docChunks.length}`);
         }
 
         if (docChunks.length === 0) {
-            console.log('RAG: No document chunks available');
             return { contextText: '', fileNames: [], retrievalDetails: [] };
         }
 
-        console.log(`RAG: Searching among ${docChunks.length} chunks for: ${question}`);
-
         // 提取问题关键词（中文词组 + 英文单词）
         const keywords = this.extractKeywords(question);
-        console.log(`RAG: Keywords extracted: ${keywords.join(", ")}`);
 
         // 计算问题向量
         const questionEmbedding = await this.generateEmbedding(question);
         let useVector = questionEmbedding.length > 0;
 
-        // 计算向量检索排名（预过滤 similarity ≥ 0.45）
+        // 计算向量检索排名（预过滤 similarity ≥ VECTOR_THRESHOLD）
         const vectorCandidates = docChunks.map(chunk => {
             const score = (useVector && chunk.embedding.length > 0) 
                 ? this.cosineSimilarity(questionEmbedding, chunk.embedding) : 0;
             return { chunk, score };
-        }).filter(item => item.score >= VECTOR_THRESHOLD); // 候选集A
+        }).filter(item => item.score >= VECTOR_THRESHOLD);
 
         const vectorSorted = vectorCandidates.sort((a, b) => b.score - a.score);
         const vectorRankMap = new Map<DocChunk, number>();
         vectorSorted.forEach((item, index) => {
-            vectorRankMap.set(item.chunk, index + 1); // 仅对候选集A排名
+            vectorRankMap.set(item.chunk, index + 1);
         });
-        console.log(`RAG: Vector candidates (≥${VECTOR_THRESHOLD}): ${vectorCandidates.length}`);
 
         // 计算关键词检索排名（使用BM25算法）
         const keywordCandidates = docChunks.map((chunk, index) => {
             const score = this.calculateBM25Score(keywords, index);
             return { chunk, score };
-        }).filter(item => item.score >= BM25_MIN_SCORE); // 候选集B（BM25分数≥阈值）
+        }).filter(item => item.score >= BM25_MIN_SCORE);
 
         const keywordSorted = keywordCandidates.sort((a, b) => b.score - a.score);
         const keywordRankMap = new Map<DocChunk, number>();
+        const keywordScoreMap = new Map<DocChunk, number>();
         keywordSorted.forEach((item, index) => {
             keywordRankMap.set(item.chunk, index + 1);
+            keywordScoreMap.set(item.chunk, item.score);
         });
-        console.log(`RAG: Keyword candidates (BM25>0): ${keywordCandidates.length}`);
 
         // 取A∪B，计算RRF分数
         const candidateChunks = new Set<DocChunk>();
         vectorRankMap.forEach((rank, chunk) => candidateChunks.add(chunk));
         keywordRankMap.forEach((rank, chunk) => candidateChunks.add(chunk));
-        console.log(`RAG: Union candidates (A∪B): ${candidateChunks.size}`);
 
         const results = Array.from(candidateChunks).map(chunk => {
             const rankVector = vectorRankMap.get(chunk) || Number.MAX_SAFE_INTEGER;
@@ -556,17 +531,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             return { chunk, rrfScore, rankVector, rankKeyword, rrfVector, rrfKeyword };
         });
 
-        // 输出RRF分数用于调试
-        results.forEach(r => {
-            console.log(`RAG: RRF=${r.rrfScore.toFixed(6)} (VectorRank=${r.rankVector}, KeywordRank=${r.rankKeyword}) with ${r.chunk.fileName}`);
-        });
-
         // 按RRF分数排序，取Top K作为候选
         const rrfResults = results
             .sort((a, b) => b.rrfScore - a.rrfScore)
             .slice(0, RRF_TOP_K);
 
-        // 保存原始RRF分数映射，用于展示
         const rrfScoreMap = new Map<DocChunk, number>();
         rrfResults.forEach(r => rrfScoreMap.set(r.chunk, r.rrfScore));
 
@@ -594,14 +563,20 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 vectorScore: result.rankVector !== undefined && result.rankVector !== Number.MAX_SAFE_INTEGER ?
                     this.cosineSimilarity(questionEmbedding, result.chunk.embedding) : undefined,
                 keywordScore: result.rankKeyword !== undefined && result.rankKeyword !== Number.MAX_SAFE_INTEGER ?
-                    keywordRankMap.get(result.chunk) || undefined : undefined,
+                    keywordScoreMap.get(result.chunk) || undefined : undefined,
                 rrfScore: originalRrfScore,
                 rankVector: result.rankVector !== undefined && result.rankVector !== Number.MAX_SAFE_INTEGER ? result.rankVector : undefined,
                 rankKeyword: result.rankKeyword !== undefined && result.rankKeyword !== Number.MAX_SAFE_INTEGER ? result.rankKeyword : undefined
             });
         }
 
-        console.log(`RAG: Found relevant docs after rerank: ${fileNames.join(", ")}`);
+        const kwStr = keywords.length > 0 ? keywords.join(', ') : '(无)';
+        console.log(`[RAG] ─── 检索 ───`);
+        console.log(`[RAG] Query: "${question}"`);
+        console.log(`[RAG] Keywords: [${kwStr}]`);
+        console.log(`[RAG] 向量候选=${vectorCandidates.length} | BM25候选=${keywordCandidates.length} | 合并=${candidateChunks.size}`);
+        console.log(`[RAG] RRF→Rerank: Top${RRF_TOP_K}→Top${RERANK_TOP_K} | 命中: ${fileNames.join(', ')}`);
+
         return { contextText, fileNames, retrievalDetails };
     }
 
@@ -633,10 +608,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                         this.stopWords.add(word.toLowerCase());
                     }
                 }
-                console.log(`RAG: Loaded ${this.stopWords.size} stop words`);
             }
-        } catch (e) {
-            console.log('RAG: Failed to load stop words, using empty set');
+        } catch {
+            // 停用词加载失败使用空集
         }
         return this.stopWords;
     }
@@ -652,27 +626,24 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.docFreqs.clear();
         let totalLength = 0;
 
-        // 对每个文档分词并统计词频
         for (const chunk of docChunks) {
             let words: string[] = [];
             try {
-                words = nodejieba.cut(chunk.content, true)
+                words = nodejieba.cut(chunk.content)
                     .map(w => w.trim().toLowerCase())
                     .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !stopWords.has(w));
-            } catch (e) {
+            } catch {
                 words = chunk.content.split(/[\s\.,;:!?，。；：！？]+/)
                     .map(w => w.toLowerCase())
                     .filter(w => w.length >= 2 && !stopWords.has(w));
             }
 
-            // 计算该文档的词频
             const termFreq = new Map<string, number>();
             for (const word of words) {
                 termFreq.set(word, (termFreq.get(word) || 0) + 1);
             }
             this.docTermFreqs.push(termFreq);
 
-            // 统计文档频率（词出现在多少篇文档中）
             const uniqueWords = new Set(words);
             for (const word of uniqueWords) {
                 this.docFreqs.set(word, (this.docFreqs.get(word) || 0) + 1);
@@ -684,7 +655,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         this.totalDocs = docChunks.length;
         this.avgdl = totalLength / this.totalDocs;
         this.bm25Ready = true;
-        console.log(`RAG: BM25 index built with ${this.totalDocs} docs, avgdl=${this.avgdl.toFixed(2)}`);
+        console.log(`[RAG] ✓ BM25 索引: ${this.totalDocs} docs, avgdl=${this.avgdl.toFixed(1)} | 停用词=${stopWords.size}`);
     }
 
     // 计算标准BM25分数
@@ -735,15 +706,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 padding: true,
                 truncation: true,
                 max_length: 512,
-                return_tensor: true,
+                return_tensors: true,
             });
 
             const outputs = await rerankerModel._call(inputs);
             const logitsData = outputs.logits.data;
             const score = logitsData[0];
             return typeof score === 'number' && isFinite(score) ? score : 0;
-        } catch (e) {
-            console.log('RAG: Cross-encoder scoring failed:', (e as Error).message);
+        } catch {
             return 0;
         }
     }
@@ -775,8 +745,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            console.log(`RAG: Cross-encoder reranking ${candidates.length} candidates...`);
-
             const scores = await Promise.all(
                 candidates.map(candidate => this.crossEncoderScore(question, candidate.chunk.content))
             );
@@ -803,13 +771,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 };
             });
 
-            console.log(`RAG: Cross-encoder rerank scores range: ${minScore.toFixed(4)} ~ ${maxScore.toFixed(4)}`);
-
             return scoredCandidates
                 .sort((a, b) => b.rerankScore - a.rerankScore)
                 .slice(0, RERANK_TOP_K);
-        } catch (e) {
-            console.log('RAG: Cross-encoder rerank failed, using RRF top results');
+        } catch {
             return candidates.slice(0, RERANK_TOP_K).map(c => ({
                 chunk: c.chunk,
                 rerankScore: c.rrfScore,
@@ -826,15 +791,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         // 使用jieba分词处理中文
         try {
-            const jiebaWords = nodejieba.cut(text, true); // 精确模式
+            const jiebaWords = nodejieba.cut(text);
             for (const word of jiebaWords) {
                 const w = word.trim().toLowerCase();
                 if (w.length >= 2 && !stopWords.has(w) && !/^\d+$/.test(w)) {
                     keywords.add(w);
                 }
             }
-        } catch (e) {
-            console.log('RAG: jieba cut failed, fallback to simple extraction');
+        } catch {
             // 降级方案：简单提取中文词组
             const chineseSegments = text.match(/[\u4e00-\u9fa5]+/g) || [];
             for (const segment of chineseSegments) {
@@ -867,7 +831,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             // 检索相关文档
             const ragResult = await this.retrieveRelevantDocs(question);
             const hasRagDocs = ragResult.fileNames.length > 0;
-            console.log(`RAG: hasRagDocs=${hasRagDocs}, files=${ragResult.fileNames.join(",")}`);
             
             // 构造用户消息内容（系统提示已在callOllama中注入，无需重复）
             let userContent = '';
