@@ -661,8 +661,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const df = this.docFreqs.get(queryWord) || 0;
             if (df === 0) continue;
 
-            // 标准BM25 IDF: log((N - df + 0.5) / (df + 0.5))
-            const idf = Math.log((this.totalDocs - df + 0.5) / (df + 0.5));
+            // Lucene BM25 IDF: log(1 + (N - df + 0.5) / (df + 0.5))
+            // 避免标准BM25中 df > N/2 时IDF为负数导致高频词惩罚文档的问题
+            const idf = Math.log(1 + (this.totalDocs - df + 0.5) / (df + 0.5));
 
             // BM25公式: IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl)))
             const numerator = tf * (BM25_K1 + 1);
