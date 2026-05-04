@@ -10,11 +10,12 @@ const OLLAMA_URL = 'http://localhost:11434/api/chat';
 const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
 const LLM_MODEL = 'qwen2.5-coder:3b';
 const EMBED_MODEL = 'bge-m3';
-const RERANKER_MODEL = 'bona/bge-reranker-v2-m3';
+const RERANKER_MODEL = 'Xenova/bge-reranker-base';
 const CHUNK_SIZE = 800;
 const CHUNK_OVERLAP = 200;
 const CACHE_DIR_NAME = 'documents_xiangliang';
 const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
+const RERANKER_CACHE_DIR = 'reranker_model';
 // 检索参数配置
 const VECTOR_THRESHOLD = 0.3;   // 向量检索预过滤阈值（余弦相似度，bge-m3分布较平，阈值可适当降低）
 const BM25_MIN_SCORE = 0.1;      // BM25最小分数阈值（过滤明显不相关的）
@@ -71,9 +72,11 @@ interface RetrievalResult {
 
 let docChunks: DocChunk[] = [];
 let docsLoaded = false;
-let modelConnected = false; // 大模型连接状态
-let initCompleted = false; // 初始化是否完成
+let modelConnected = false;
+let initCompleted = false;
 let rerankerReady = false;
+let rerankerModel: any = null;
+let rerankerTokenizer: any = null;
 
 export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiAssistantView';
@@ -93,7 +96,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private async initialize(): Promise<void> {
         console.log('RAG: Starting initialization...');
 
-        // 并行执行文档加载和模型连接检查
         const [modelOk] = await Promise.all([
             this.checkModelConnection(),
             this.loadDocumentsWithEmbeddings()
@@ -102,13 +104,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         modelConnected = modelOk;
 
         if (modelOk) {
-            rerankerReady = true;
-            console.log('RAG: Reranker ready (using ' + RERANKER_MODEL + ')');
+            this.loadReranker();
         }
 
         initCompleted = true;
 
-        // 通知前端初始化完成
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
                 type: 'initComplete',
@@ -153,6 +153,56 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 resolve(false);
             }
         });
+    }
+
+    private async loadReranker(): Promise<void> {
+        if (rerankerModel && rerankerTokenizer) {
+            rerankerReady = true;
+            return;
+        }
+
+        try {
+            const modelCacheDir = path.join(this._context.extensionPath, RERANKER_CACHE_DIR);
+            if (!fs.existsSync(modelCacheDir)) {
+                fs.mkdirSync(modelCacheDir, { recursive: true });
+            }
+
+            const transformers = await import('@xenova/transformers');
+            transformers.env.cacheDir = modelCacheDir;
+            transformers.env.allowLocalModels = true;
+
+            const cachedModelDir = path.join(modelCacheDir, RERANKER_MODEL);
+            const isCached = fs.existsSync(path.join(cachedModelDir, 'onnx'));
+
+            if (!isCached) {
+                transformers.env.remoteHost = 'https://hf-mirror.com/';
+                console.log(`RAG: Model not cached, downloading from hf-mirror.com...`);
+            } else {
+                console.log(`RAG: Model found in cache, loading locally...`);
+            }
+
+            console.log(`RAG: Loading reranker model ${RERANKER_MODEL}...`);
+
+            const [model, tokenizer] = await Promise.all([
+                transformers.AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL, {
+                    quantized: true,
+                    progress_callback: (progress: { status: string; file?: string; progress?: number }) => {
+                        if (progress.status === 'progress' && progress.file) {
+                            console.log(`RAG: Reranker download: ${progress.file} - ${progress.progress?.toFixed(1)}%`);
+                        }
+                    }
+                }),
+                transformers.AutoTokenizer.from_pretrained(RERANKER_MODEL)
+            ]);
+
+            rerankerModel = model;
+            rerankerTokenizer = tokenizer;
+            rerankerReady = true;
+            console.log(`RAG: Reranker model ${RERANKER_MODEL} loaded successfully`);
+        } catch (e) {
+            console.log('RAG: Failed to load reranker model:', (e as Error).message);
+            rerankerReady = false;
+        }
     }
 
     // 对话历史，初始带系统提示词
@@ -675,46 +725,27 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async crossEncoderScore(question: string, document: string): Promise<number> {
-        return new Promise((resolve) => {
-            try {
-                const input = `${question} [SEP] ${document.substring(0, 512)}`;
-                const body = JSON.stringify({
-                    model: RERANKER_MODEL,
-                    prompt: input
-                });
+        if (!rerankerModel || !rerankerTokenizer) {
+            return 0;
+        }
 
-                cp.execFile('curl', [
-                    '-s', '-X', 'POST',
-                    OLLAMA_EMBED_URL,
-                    '-H', 'Content-Type: application/json',
-                    '-d', body
-                ], { timeout: 120000 }, (error, stdout) => {
-                    if (error) {
-                        console.log('RAG: Cross-encoder request failed:', error.message);
-                        resolve(0);
-                        return;
-                    }
-                    try {
-                        const data = JSON.parse(stdout);
-                        const embedding: number[] = data.embedding || [];
-                        if (embedding.length === 0) {
-                            resolve(0);
-                            return;
-                        }
-                        let normSq = 0;
-                        for (const v of embedding) {
-                            normSq += v * v;
-                        }
-                        resolve(Math.sqrt(normSq));
-                    } catch (e) {
-                        console.log('RAG: Cross-encoder parse error:', stdout?.substring(0, 200));
-                        resolve(0);
-                    }
-                });
-            } catch (e) {
-                resolve(0);
-            }
-        });
+        try {
+            const inputs = rerankerTokenizer._call(question, {
+                text_pair: document,
+                padding: true,
+                truncation: true,
+                max_length: 512,
+                return_tensor: true,
+            });
+
+            const outputs = await rerankerModel._call(inputs);
+            const logitsData = outputs.logits.data;
+            const score = logitsData[0];
+            return typeof score === 'number' && isFinite(score) ? score : 0;
+        } catch (e) {
+            console.log('RAG: Cross-encoder scoring failed:', (e as Error).message);
+            return 0;
+        }
     }
 
     private async rerankDocs(question: string, candidates: Array<{chunk: DocChunk, rrfScore: number, rankVector?: number, rankKeyword?: number}>): Promise<Array<{chunk: DocChunk, rerankScore: number, rankVector?: number, rankKeyword?: number}>> {
@@ -731,6 +762,18 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             }));
         }
 
+        if (!rerankerModel || !rerankerTokenizer) {
+            await this.loadReranker();
+            if (!rerankerModel || !rerankerTokenizer) {
+                return candidates.slice(0, RERANK_TOP_K).map(c => ({
+                    chunk: c.chunk,
+                    rerankScore: c.rrfScore,
+                    rankVector: c.rankVector,
+                    rankKeyword: c.rankKeyword
+                }));
+            }
+        }
+
         try {
             console.log(`RAG: Cross-encoder reranking ${candidates.length} candidates...`);
 
@@ -740,21 +783,27 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
             let maxScore = -Infinity;
             let minScore = Infinity;
-            for (const s of scores) {
-                if (s > maxScore) maxScore = s;
-                if (s < minScore) minScore = s;
+            let maxRrf = -Infinity;
+            let minRrf = Infinity;
+            for (let i = 0; i < scores.length; i++) {
+                if (scores[i] > maxScore) maxScore = scores[i];
+                if (scores[i] < minScore) minScore = scores[i];
+                if (candidates[i].rrfScore > maxRrf) maxRrf = candidates[i].rrfScore;
+                if (candidates[i].rrfScore < minRrf) minRrf = candidates[i].rrfScore;
             }
             const scoreRange = maxScore - minScore || 1;
+            const rrfRange = maxRrf - minRrf || 1;
 
             const scoredCandidates = candidates.map((candidate, idx) => {
-                const normalizedScore = (scores[idx] - minScore) / scoreRange;
+                const normalizedRerank = (scores[idx] - minScore) / scoreRange;
+                const normalizedRrf = (candidate.rrfScore - minRrf) / rrfRange;
                 return {
                     ...candidate,
-                    rerankScore: normalizedScore * 0.8 + (candidate.rrfScore / (candidates[0]?.rrfScore || 1)) * 0.2
+                    rerankScore: normalizedRerank * 0.8 + normalizedRrf * 0.2
                 };
             });
 
-            console.log(`RAG: Cross-encoder rerank scores range: ${minScore.toFixed(2)} ~ ${maxScore.toFixed(2)}`);
+            console.log(`RAG: Cross-encoder rerank scores range: ${minScore.toFixed(4)} ~ ${maxScore.toFixed(4)}`);
 
             return scoredCandidates
                 .sort((a, b) => b.rerankScore - a.rerankScore)
