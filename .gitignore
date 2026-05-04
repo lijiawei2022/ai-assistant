@@ -3,3 +3,7 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+finetune/base_model/
+finetune/output/
+finetune/merged_model/
