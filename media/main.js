@@ -18,43 +18,83 @@
     let loadingMessageEl = null;
 
     function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function renderMarkdown(text) {
-        let html = escapeHtml(text);
+        const tokens = [];
+        let src = text;
 
-        html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(match, lang, code) {
-            return '<pre class="code-block"><code class="lang-' + (lang || 'text') + '">' + code.trim() + '</code></pre>';
+        src = src.replace(/```(\w*)\n([\s\S]*?)```/g, function(match, lang, code) {
+            const idx = tokens.length;
+            tokens.push('<div class="code-wrapper"><div class="code-header"><span class="code-lang">' +
+                (lang || 'code') + '</span><button class="copy-btn" onclick="copyCode(this)">复制</button></div><pre class="code-block"><code>' +
+                escapeHtml(code.trimEnd()) + '</code></pre></div>');
+            return '\x00TOK' + idx + '\x00';
         });
 
-        html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+        src = src.replace(/`([^`\n]+)`/g, function(match, code) {
+            const idx = tokens.length;
+            tokens.push('<code class="inline-code">' + escapeHtml(code) + '</code>');
+            return '\x00TOK' + idx + '\x00';
+        });
 
-        html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-        html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-        html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+        src = escapeHtml(src);
 
-        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-        html = html.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
+        for (let i = 0; i < tokens.length; i++) {
+            src = src.replace('\x00TOK' + i + '\x00', tokens[i]);
+        }
 
-        html = html.replace(/^(\s*)- (.+)$/gm, '$1• $2');
+        src = src.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
+        src = src.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+        src = src.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+        src = src.replace(/^# (.+)$/gm, '<h2>$1</h2>');
 
-        html = html.replace(/^(\s*)\d+\. (.+)$/gm, '$1$2');
+        src = src.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        src = src.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
 
-        html = html.replace(/\n\n/g, '</p><p>');
-        html = html.replace(/\n/g, '<br>');
+        src = src.replace(/^(\s*)- (.+)$/gm, function(m, indent, content) {
+            return indent + '<li>' + content + '</li>';
+        });
 
-        html = '<p>' + html + '</p>';
-        html = html.replace(/<p>\s*<\/p>/g, '');
-        html = html.replace(/<p>\s*(<h[2-4]>)/g, '$1');
-        html = html.replace(/(<\/h[2-4]>)\s*<\/p>/g, '$1');
-        html = html.replace(/<p>\s*(<pre)/g, '$1');
-        html = html.replace(/(<\/pre>)\s*<\/p>/g, '$1');
+        src = src.replace(/^(\s*)\d+\. (.+)$/gm, function(m, indent, content) {
+            return indent + '<li>' + content + '</li>';
+        });
 
-        return html;
+        src = src.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+        src = src.replace(/\n{2,}/g, '</p><p>');
+        src = src.replace(/\n/g, '<br>');
+        src = '<p>' + src + '</p>';
+
+        src = src.replace(/<p>\s*<\/p>/g, '');
+        src = src.replace(/<p>\s*(<h[2-5]>)/g, '$1');
+        src = src.replace(/(<\/h[2-5]>)\s*<\/p>/g, '$1');
+        src = src.replace(/<p>\s*(<div class="code-wrapper">)/g, '$1');
+        src = src.replace(/(<\/div>)\s*<\/p>/g, '$1');
+        src = src.replace(/<p>\s*(<ul>)/g, '$1');
+        src = src.replace(/(<\/ul>)\s*<\/p>/g, '$1');
+
+        return src;
     }
+
+    window.copyCode = function(btn) {
+        const codeBlock = btn.closest('.code-wrapper').querySelector('code');
+        const text = codeBlock.textContent;
+        navigator.clipboard.writeText(text).then(() => {
+            btn.textContent = '已复制';
+            btn.classList.add('copied');
+            setTimeout(() => {
+                btn.textContent = '复制';
+                btn.classList.remove('copied');
+            }, 1500);
+        });
+    };
 
     function setLoading(loading) {
         isLoading = loading;
@@ -67,9 +107,13 @@
             loadingMessageEl = document.createElement('div');
             loadingMessageEl.className = 'message ai-message loading-message';
             loadingMessageEl.innerHTML = `
-                <div class="message-label">AI Assistant:</div>
-                <div class="message-content">
-                    <span class="loading-dots">思考中<span>.</span><span>.</span><span>.</span></span>
+                <div class="message-avatar ai-avatar">AI</div>
+                <div class="message-body">
+                    <div class="message-content">
+                        <div class="typing-indicator">
+                            <span></span><span></span><span></span>
+                        </div>
+                    </div>
                 </div>
             `;
             chatMessages.appendChild(loadingMessageEl);
@@ -90,30 +134,33 @@
             displayCode = code.substring(0, 500) + '... (truncated)';
         }
         selectedCodeEl.textContent = displayCode;
-        contextInfo.textContent = `📄 ${fileName} • ${language} • ${code.split('\n').length} lines`;
+        contextInfo.textContent = `${fileName} · ${language} · ${code.split('\n').length} lines`;
         codeContext.style.display = 'block';
         statusElement.textContent = 'Code context loaded';
     }
 
     function addMessage(text, isUser, isError, retrievalDetails, featureType) {
         const messageDiv = document.createElement('div');
-        let className = `message ${isUser ? 'user-message' : 'ai-message'}`;
+        let className = 'message ' + (isUser ? 'user-message' : 'ai-message');
         if (isError) className += ' error-message';
-        if (featureType === 'syntaxCheck') className += ' syntax-check-message';
-        if (featureType === 'learningPath') className += ' learning-path-message';
+        if (featureType === 'syntaxCheck') className += ' feature-syntax';
+        if (featureType === 'learningPath') className += ' feature-learning';
         messageDiv.className = className;
 
-        const label = document.createElement('div');
-        label.className = 'message-label';
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar ' + (isUser ? 'user-avatar' : 'ai-avatar');
         if (isUser) {
-            label.textContent = 'You:';
+            avatar.textContent = 'U';
         } else if (featureType === 'syntaxCheck') {
-            label.textContent = '🔍 语法检查:';
+            avatar.textContent = '🔍';
         } else if (featureType === 'learningPath') {
-            label.textContent = '📚 学习路径:';
+            avatar.textContent = '📚';
         } else {
-            label.textContent = 'AI Assistant:';
+            avatar.textContent = 'AI';
         }
+
+        const body = document.createElement('div');
+        body.className = 'message-body';
 
         const content = document.createElement('div');
         content.className = 'message-content markdown-body';
@@ -125,13 +172,15 @@
             content.innerHTML = renderMarkdown(text);
         }
 
-        messageDiv.appendChild(label);
-        messageDiv.appendChild(content);
+        body.appendChild(content);
 
         if (!isUser && retrievalDetails && retrievalDetails.length > 0) {
             const debugPanel = createDebugPanel(retrievalDetails);
-            messageDiv.appendChild(debugPanel);
+            body.appendChild(debugPanel);
         }
+
+        messageDiv.appendChild(avatar);
+        messageDiv.appendChild(body);
 
         chatMessages.appendChild(messageDiv);
         chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -144,38 +193,39 @@
 
         const summary = document.createElement('summary');
         summary.className = 'debug-summary';
-        summary.textContent = `🔍 检索详情 (${details.length} 个文档块)`;
+        summary.textContent = `检索详情 (${details.length} 个文档块)`;
 
         const content = document.createElement('div');
         content.className = 'debug-content';
 
-        details.forEach((doc, index) => {
+        details.forEach((doc) => {
             const docDiv = document.createElement('div');
             docDiv.className = 'debug-doc';
 
-            const scoresDiv = document.createElement('div');
-            scoresDiv.className = 'debug-scores';
-            let scoreText = `RRF: ${doc.rrfScore.toFixed(4)}`;
-            if (doc.vectorScore !== undefined) {
-                scoreText += ` | 向量: ${doc.vectorScore.toFixed(4)}`;
-            }
-            if (doc.keywordScore !== undefined) {
-                scoreText += ` | 关键词: ${doc.keywordScore}`;
-            }
-            scoresDiv.textContent = `📊 ${scoreText}`;
+            const headerDiv = document.createElement('div');
+            headerDiv.className = 'debug-doc-header';
+
+            const fileSpan = document.createElement('span');
+            fileSpan.className = 'debug-file';
+            fileSpan.textContent = doc.fileName;
+
+            const scoresSpan = document.createElement('span');
+            scoresSpan.className = 'debug-scores';
+            let scoreText = `RRF ${doc.rrfScore.toFixed(4)}`;
+            if (doc.vectorScore !== undefined) scoreText += ` · Vec ${doc.vectorScore.toFixed(4)}`;
+            if (doc.keywordScore !== undefined) scoreText += ` · KW ${doc.keywordScore.toFixed(2)}`;
+            scoresSpan.textContent = scoreText;
+
+            headerDiv.appendChild(fileSpan);
+            headerDiv.appendChild(scoresSpan);
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'debug-doc-content';
-            const displayContent = doc.content.length > 300 ?
-                doc.content.substring(0, 300) + '...' : doc.content;
+            const displayContent = doc.content.length > 200 ?
+                doc.content.substring(0, 200) + '...' : doc.content;
             contentDiv.textContent = displayContent;
 
-            const fileDiv = document.createElement('div');
-            fileDiv.className = 'debug-file';
-            fileDiv.textContent = `📄 ${doc.fileName}`;
-
-            docDiv.appendChild(scoresDiv);
-            docDiv.appendChild(fileDiv);
+            docDiv.appendChild(headerDiv);
             docDiv.appendChild(contentDiv);
             content.appendChild(docDiv);
         });
@@ -261,5 +311,5 @@
         }
     });
 
-    addMessage('Hello! I am your AI coding assistant. Ask me anything!', false);
+    addMessage('你好！我是AI编程助教，专注于C语言程序设计。你可以问我编程问题，或者使用下方快捷按钮进行语法检查和获取学习路径推荐。', false);
 })();
