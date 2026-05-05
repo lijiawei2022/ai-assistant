@@ -1126,24 +1126,47 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         try {
             const editor = vscode.window.activeTextEditor;
             if (!editor) {
-                if (AiAssistantViewProvider.currentPanel) {
-                    AiAssistantViewProvider.currentPanel.webview.postMessage({
-                        type: 'aiResponse',
-                        response: '请先打开一个C语言源文件，再进行语法检查。',
-                        hasContext: false,
-                        isError: true,
-                        featureType: 'syntaxCheck'
-                    });
-                }
+                vscode.window.showWarningMessage('请先打开一个C语言源文件，再进行语法检查。');
                 return;
             }
 
             const selection = editor.selection;
             const selectedText = editor.document.getText(selection);
             const fullText = editor.document.getText();
-            const code = selectedText || fullText;
             const fileName = editor.document.fileName.split(/[\\/]/).pop() || 'unknown';
             const language = editor.document.languageId;
+
+            const items: vscode.QuickPickItem[] = [];
+            if (selectedText) {
+                items.push({
+                    label: '$(code) 检查选中代码',
+                    description: `${selectedText.split('\n').length} 行`,
+                    detail: selectedText.length > 60 ? selectedText.substring(0, 60) + '...' : selectedText
+                });
+            }
+            items.push({
+                label: '$(file-code) 检查整个文件',
+                description: `${fileName} · ${fullText.split('\n').length} 行`
+            });
+
+            const picked = await vscode.window.showQuickPick(items, {
+                placeHolder: '选择语法检查范围'
+            });
+
+            if (!picked) {
+                return;
+            }
+
+            const checkSelected = selectedText && picked.label.includes('选中');
+            const code = checkSelected ? selectedText : fullText;
+
+            const checkScope = checkSelected ? '选中代码' : '整个文件';
+            if (AiAssistantViewProvider.currentPanel) {
+                AiAssistantViewProvider.currentPanel.webview.postMessage({
+                    type: 'userAction',
+                    text: `🔍 语法检查 — ${fileName}（${checkScope}）`
+                });
+            }
 
             let gccOutput = '';
             let gccAvailable = false;
@@ -1157,11 +1180,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             let userContent = `请对以下代码进行全面语法检查：\n\n文件：${fileName}\n语言：${language}\n\n代码：\n\`\`\`c\n${code}\n\`\`\``;
 
             if (gccAvailable && gccOutput.trim()) {
-                userContent += `\n\n编译器输出（请优先解释这些错误）：\n\`\`\`\n${gccOutput}\n\`\`\``;
-            } else if (gccAvailable) {
-                userContent += `\n\n编译器检查通过（无语法错误），请重点检查潜在运行时错误、逻辑错误和代码规范。`;
-            } else {
-                userContent += `\n\n（GCC编译器不可用，请直接对代码进行全面检查）`;
+                userContent += `\n\nGCC编译器输出：\n\`\`\`\n${gccOutput}\n\`\`\``;
             }
 
             const messages = [
@@ -1214,6 +1233,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private async handleLearningPath() {
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
+                type: 'userAction',
+                text: '📚 推荐学习路径'
+            });
+            AiAssistantViewProvider.currentPanel.webview.postMessage({
                 type: 'loading',
                 isLoading: true
             });
@@ -1253,7 +1276,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     type: 'aiResponse',
                     response: finalAnswer,
                     hasContext: false,
-                    featureType: 'learningPath'
+                    featureType: 'learningPath',
+                    retrievalDetails: ragResult.retrievalDetails || []
                 });
             }
         } catch (error) {
@@ -1283,15 +1307,21 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         try {
             fs.writeFileSync(tmpFile, code, 'utf-8');
+            console.log(`[GCC] 临时文件: ${tmpFile}, 代码长度: ${code.length}`);
+
+            const gccCmd = process.platform === 'win32' ? 'gcc.exe' : 'gcc';
 
             return new Promise<string>((resolve, reject) => {
-                execFile('gcc', ['-fsyntax-only', '-Wall', '-Wextra', '-std=c11', tmpFile],
+                execFile(gccCmd, ['-fsyntax-only', '-Wall', '-Wextra', '-std=c11', tmpFile],
                     { timeout: 10000 },
                     (error, stdout, stderr) => {
                         try { fs.unlinkSync(tmpFile); } catch {}
+                        const out = (stdout || '').toString();
+                        const err = (stderr || '').toString();
+                        console.log(`[GCC] exitCode=${error?.code ?? 0}, stderr=${err.substring(0, 200)}`);
                         if (error) {
-                            const output = (stderr || stdout || '').toString();
-                            resolve(output.replace(new RegExp(tmpFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), 'source.c'));
+                            const output = (err || out).replace(new RegExp(tmpFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), 'source.c');
+                            resolve(output);
                         } else {
                             resolve('');
                         }
@@ -1335,6 +1365,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private async callOllamaWithPrompt(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
         console.log('[LLM] 专用功能调用');
         console.log(`[LLM] 消息数: ${messages.length}`);
+        for (const msg of messages) {
+            console.log(`[LLM] --- ${msg.role.toUpperCase()} ---`);
+            console.log(msg.content);
+        }
 
         try {
             const data = await ollamaRequest(LLM_URL, {

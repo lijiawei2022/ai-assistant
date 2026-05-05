@@ -139,7 +139,7 @@
         statusElement.textContent = 'Code context loaded';
     }
 
-    function addMessage(text, isUser, isError, retrievalDetails, featureType) {
+    function addMessage(text, isUser, isError, retrievalDetails, featureType, llmMessages) {
         const messageDiv = document.createElement('div');
         let className = 'message ' + (isUser ? 'user-message' : 'ai-message');
         if (isError) className += ' error-message';
@@ -177,6 +177,11 @@
         if (!isUser && retrievalDetails && retrievalDetails.length > 0) {
             const debugPanel = createDebugPanel(retrievalDetails);
             body.appendChild(debugPanel);
+        }
+
+        if (!isUser && llmMessages && llmMessages.length > 0) {
+            const llmPanel = createLlmMessagesPanel(llmMessages);
+            body.appendChild(llmPanel);
         }
 
         messageDiv.appendChild(avatar);
@@ -228,6 +233,49 @@
             docDiv.appendChild(headerDiv);
             docDiv.appendChild(contentDiv);
             content.appendChild(docDiv);
+        });
+
+        panel.appendChild(summary);
+        panel.appendChild(content);
+        return panel;
+    }
+
+    function createLlmMessagesPanel(messages) {
+        const panel = document.createElement('details');
+        panel.className = 'debug-panel llm-messages-panel';
+        panel.open = false;
+
+        const summary = document.createElement('summary');
+        summary.className = 'debug-summary';
+        summary.textContent = '发送给大模型的消息 (' + messages.length + ' 条)';
+
+        const content = document.createElement('div');
+        content.className = 'debug-content';
+
+        messages.forEach(function(msg) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = 'llm-msg';
+
+            const roleLabel = document.createElement('div');
+            roleLabel.className = 'llm-msg-role';
+            if (msg.role === 'system') {
+                roleLabel.textContent = 'SYSTEM';
+                roleLabel.classList.add('role-system');
+            } else if (msg.role === 'user') {
+                roleLabel.textContent = 'USER';
+                roleLabel.classList.add('role-user');
+            } else {
+                roleLabel.textContent = 'ASSISTANT';
+                roleLabel.classList.add('role-assistant');
+            }
+
+            const msgContent = document.createElement('pre');
+            msgContent.className = 'llm-msg-content';
+            msgContent.textContent = msg.content;
+
+            msgDiv.appendChild(roleLabel);
+            msgDiv.appendChild(msgContent);
+            content.appendChild(msgDiv);
         });
 
         panel.appendChild(summary);
@@ -292,7 +340,7 @@
         const message = event.data;
         switch (message.type) {
             case 'aiResponse':
-                addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType);
+                addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType, message.llmMessages);
                 statusElement.textContent = 'Response received';
                 break;
             case 'selectedCode':
@@ -300,6 +348,9 @@
                 break;
             case 'loading':
                 setLoading(message.isLoading);
+                break;
+            case 'userAction':
+                addMessage(message.text, true);
                 break;
             case 'triggerFeature':
                 if (message.featureType === 'syntaxCheck' && syntaxCheckBtn) {
