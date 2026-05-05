@@ -3,9 +3,10 @@ HuggingFace 模型推理服务
 兼容 Ollama /api/chat 接口格式，供 VSCode 插件直接调用
 
 用法:
-  python serve.py                          # 使用 base_model
-  python serve.py --lora output/final      # 使用 LoRA 微调后的模型
-  python serve.py --port 8000              # 指定端口
+  python serve.py                              # 使用合并后的微调模型（默认）
+  python serve.py --base_only                  # 仅使用原始基础模型
+  python serve.py --lora output/final          # 动态加载LoRA（不推荐，较慢）
+  python serve.py --port 8000                  # 指定端口
 
 启动后，插件只需将 OLLAMA_URL 改为 http://localhost:8000/api/chat
 """
@@ -22,10 +23,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MERGED_MODEL = os.path.join(SCRIPT_DIR, "merged_model")
 DEFAULT_BASE_MODEL = os.path.join(SCRIPT_DIR, "base_model")
 DEFAULT_PORT = 8000
 
@@ -131,22 +133,21 @@ async def health():
     return {"status": "ok", "model_loaded": model is not None}
 
 
-def load_model(base_model: str, lora_path: Optional[str] = None):
+def load_model(model_path: str, lora_path: Optional[str] = None):
     global model, tokenizer
 
-    print(f"Loading tokenizer from: {base_model}")
+    print(f"Loading tokenizer from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model,
+        model_path,
         trust_remote_code=True,
         padding_side="right",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading model from: {base_model}")
+    print(f"Loading model from: {model_path}")
     print("Using 4-bit quantization (NF4) to fit in 6GB VRAM...")
 
-    from transformers import BitsAndBytesConfig
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -155,7 +156,7 @@ def load_model(base_model: str, lora_path: Optional[str] = None):
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model,
+        model_path,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
@@ -175,31 +176,42 @@ def load_model(base_model: str, lora_path: Optional[str] = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL)
+    parser.add_argument("--base_only", action="store_true",
+                        help="Use base model only (no fine-tuning)")
     parser.add_argument("--lora", type=str, default=None,
                         help="Path to LoRA weights (e.g. output/final)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
 
-    if not os.path.exists(args.base_model):
-        print(f"ERROR: Base model not found at: {args.base_model}")
-        print("Please download the model first: python download_model.py")
+    if args.base_only:
+        model_path = DEFAULT_BASE_MODEL
+        model_desc = "Base model (no fine-tuning)"
+    elif args.lora:
+        model_path = DEFAULT_BASE_MODEL
+        model_desc = f"Base model + LoRA ({args.lora})"
+    elif os.path.exists(DEFAULT_MERGED_MODEL):
+        model_path = DEFAULT_MERGED_MODEL
+        model_desc = "Merged fine-tuned model"
+    else:
+        model_path = DEFAULT_BASE_MODEL
+        model_desc = "Base model (merged model not found)"
+
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found at: {model_path}")
         sys.exit(1)
 
     print("=" * 60)
     print("  HuggingFace LLM Serve (Ollama-compatible)")
-    print(f"  Base model: {args.base_model}")
-    print(f"  LoRA:       {args.lora or 'None (base model only)'}")
-    print(f"  Port:       {args.port}")
-    print(f"  Endpoint:   http://localhost:{args.port}/api/chat")
+    print(f"  Model:    {model_desc}")
+    print(f"  Path:     {model_path}")
+    print(f"  Port:     {args.port}")
+    print(f"  Endpoint: http://localhost:{args.port}/api/chat")
     print("=" * 60)
 
-    load_model(args.base_model, args.lora)
+    load_model(model_path, args.lora)
 
     print(f"\nServer starting at http://localhost:{args.port}")
     print(f"Ollama-compatible endpoint: http://localhost:{args.port}/api/chat")
-    print("\nTo use in plugin, change OLLAMA_URL to:")
-    print(f'  const OLLAMA_URL = "http://localhost:{args.port}/api/chat";')
     print("\nPress Ctrl+C to stop.\n")
 
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")

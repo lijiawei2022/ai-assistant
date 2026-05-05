@@ -1,10 +1,11 @@
 """
 推理测试脚本 - 验证微调后的模型效果
+使用4-bit量化加载，适配6GB显存
 """
 
 import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,44 +24,84 @@ def test_inference(
         trust_remote_code=True,
     )
 
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
     if use_lora:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            torch_dtype=torch.bfloat16,
+            quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
         )
         model = PeftModel.from_pretrained(model, model_path)
-        model = model.merge_and_unload()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
         )
 
     model.eval()
 
-    system_prompt = "你是一位经验丰富的C语言编程教师，擅长用清晰易懂的方式解答编程问题，注重实践经验和常见陷阱的讲解。"
+    system_prompt = "你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。熟悉C语言等主流编程语言，精通数据结构、算法、软件工程等核心知识。\n\n## 输入格式\n每条用户消息固定包含以下三部分（某部分为\"空\"表示未提供）：\n- 用户问题：用户的核心诉求\n- 用户提供的代码：用户选中的代码片段\n- 参考文档：从知识库检索的相关文档\n\n## 回答要求\n1. 优先依据参考文档作答，文档不足或不相关时基于专业知识回答\n2. 代码不为空时，结合代码实际情况分析问题，将文档知识与代码对应\n3. 简洁精准，直接回答核心问题\n4. 必要时提供完整可运行的代码示例（用代码块包裹）\n5. 使用简洁中文，专业术语保留英文原文"
 
-    test_questions = [
-        "我的程序出现了段错误，怎么排查？",
-        "C语言中 malloc 和 calloc 有什么区别？",
-        "如何用C语言实现一个链表？",
-        "为什么我的scanf读取字符串后，下一个输入被跳过了？",
-        "C语言中指针和数组有什么区别？",
-        "如何避免内存泄漏？",
+    test_cases = [
+        {
+            "question": "我的程序出现了段错误，怎么排查？",
+            "code": None,
+            "docs": None,
+        },
+        {
+            "question": "这段代码有什么问题？",
+            "code": "int *p;\n*p = 42;\nprintf(\"%d\\n\", *p);",
+            "docs": None,
+        },
+        {
+            "question": "C语言中 malloc 和 calloc 有什么区别？",
+            "code": None,
+            "docs": None,
+        },
+        {
+            "question": "如何用C语言实现一个链表？",
+            "code": None,
+            "docs": None,
+        },
+        {
+            "question": "这段代码有什么问题？",
+            "code": "char *s = \"hello\";\ns[0] = 'H';",
+            "docs": None,
+        },
+        {
+            "question": "我的链表删除节点后程序崩溃了",
+            "code": "void delete_node(Node *head, int target) {\n    Node *cur = head;\n    while (cur && cur->data != target)\n        cur = cur->next;\n    if (cur) free(cur);\n}",
+            "docs": "链表删除节点时，必须先将被删除节点的前驱节点的next指针指向后继节点，否则链表断裂。",
+        },
     ]
 
     print("\n" + "=" * 60)
-    print("Testing fine-tuned model")
+    print("Testing fine-tuned model (Plugin Message Format)")
     print("=" * 60)
 
-    for q in test_questions:
+    for tc in test_cases:
+        q = tc["question"]
+        code = tc.get("code")
+        docs = tc.get("docs")
+
+        user_content = f"用户问题：{q}"
+        user_content += f"\n\n用户提供的代码：\n{code}" if code else "\n\n用户提供的代码：空"
+        user_content += f"\n\n参考文档：\n{docs}" if docs else "\n\n参考文档：空"
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": q},
+            {"role": "user", "content": user_content},
         ]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -84,7 +125,11 @@ def test_inference(
 
         print(f"\n{'─' * 40}")
         print(f"Q: {q}")
-        print(f"A: {response[:500]}...")
+        if code:
+            print(f"Code: {code[:80]}...")
+        if docs:
+            print(f"Docs: {docs[:80]}...")
+        print(f"A: {response[:600]}")
         print()
 
 

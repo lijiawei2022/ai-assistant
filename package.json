@@ -29,6 +29,14 @@
       {
         "command": "ai-assitant.analyzeCode",
         "title": "AI Assistant: Analyze Selected Code"
+      },
+      {
+        "command": "ai-assitant.syntaxCheck",
+        "title": "AI Assistant: Syntax Check"
+      },
+      {
+        "command": "ai-assitant.learningPath",
+        "title": "AI Assistant: Learning Path"
       }
     ],
     "viewsContainers": {
@@ -54,6 +62,18 @@
         "command": "ai-assitant.analyzeCode",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "ai-assitant.syntaxCheck",
+        "key": "ctrl+shift+s",
+        "mac": "cmd+shift+s",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "ai-assitant.learningPath",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l",
         "when": "editorTextFocus"
       }
     ]

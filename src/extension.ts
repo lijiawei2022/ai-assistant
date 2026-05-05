@@ -44,13 +44,31 @@ export function activate(context: vscode.ExtensionContext) {
         }, 500);
     });
 
+    // Register command: Syntax check
+    let syntaxCheck = vscode.commands.registerCommand('ai-assitant.syntaxCheck', () => {
+        AiAssistantViewProvider.createOrShow(context.extensionUri);
+        setTimeout(() => {
+            AiAssistantViewProvider.triggerFeature('syntaxCheck');
+        }, 300);
+    });
+
+    // Register command: Learning path
+    let learningPath = vscode.commands.registerCommand('ai-assitant.learningPath', () => {
+        AiAssistantViewProvider.createOrShow(context.extensionUri);
+        setTimeout(() => {
+            AiAssistantViewProvider.triggerFeature('learningPath');
+        }, 300);
+    });
+
     // Register the webview view provider
     const provider = new AiAssistantViewProvider(context.extensionUri, context);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(AiAssistantViewProvider.viewType, provider)
     );
 
-    context.subscriptions.push(helloWorld, showPanel, analyzeCode);
+    context.subscriptions.push(helloWorld, showPanel, analyzeCode, syntaxCheck, learningPath);
 }
 
-export function deactivate() {}
+export function deactivate() {
+    AiAssistantViewProvider.stopModelServer();
+}

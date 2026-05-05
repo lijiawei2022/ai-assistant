@@ -53,9 +53,9 @@ class FineTuneConfig:
     weight_decay: float = field(default=0.01)
     lr_scheduler_type: str = field(default="cosine")
 
-    logging_steps: int = field(default=10)
-    save_steps: int = field(default=100)
-    eval_steps: int = field(default=100)
+    logging_steps: int = field(default=5)
+    save_steps: int = field(default=50)
+    eval_steps: int = field(default=50)
     save_total_limit: int = field(default=3)
 
 

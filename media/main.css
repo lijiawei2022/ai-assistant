@@ -86,7 +86,7 @@ header p {
 .message {
     padding: 8px 12px;
     border-radius: 6px;
-    max-width: 85%;
+    max-width: 95%;
 }
 
 .user-message {
@@ -100,6 +100,14 @@ header p {
     align-self: flex-start;
 }
 
+.syntax-check-message {
+    border-left: 3px solid var(--vscode-charts-orange, #e5a00d);
+}
+
+.learning-path-message {
+    border-left: 3px solid var(--vscode-charts-blue, #3794ff);
+}
+
 .message-label {
     font-weight: 600;
     font-size: 11px;
@@ -108,7 +116,7 @@ header p {
 }
 
 .message-content {
-    line-height: 1.4;
+    line-height: 1.5;
 }
 
 .loading-message {
@@ -137,6 +145,33 @@ header p {
     display: flex;
     flex-direction: column;
     gap: 8px;
+}
+
+.quick-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.action-btn {
+    flex: 1;
+    padding: 5px 8px;
+    background-color: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: background-color 0.15s;
+}
+
+.action-btn:hover {
+    background-color: var(--vscode-button-secondaryHoverBackground);
+}
+
+.action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 #question-input {
@@ -198,6 +233,62 @@ header p {
 
 .error-message {
     border-left: 3px solid var(--vscode-errorForeground);
+}
+
+/* Markdown 渲染样式 */
+.markdown-body {
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.markdown-body h2 {
+    font-size: 15px;
+    margin: 10px 0 6px 0;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.markdown-body h3 {
+    font-size: 14px;
+    margin: 8px 0 4px 0;
+}
+
+.markdown-body h4 {
+    font-size: 13px;
+    margin: 6px 0 4px 0;
+}
+
+.markdown-body strong {
+    font-weight: 600;
+}
+
+.markdown-body em {
+    font-style: italic;
+}
+
+.markdown-body .code-block {
+    background-color: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-family: 'Courier New', Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: pre;
+}
+
+.markdown-body .inline-code {
+    background-color: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.1));
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: 'Courier New', Consolas, monospace;
+    font-size: 12px;
+}
+
+.markdown-body p {
+    margin: 2px 0;
 }
 
 /* 调试面板样式 */
