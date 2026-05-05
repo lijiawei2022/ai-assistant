@@ -307,6 +307,16 @@ header p {
     background-color: var(--vscode-button-secondaryHoverBackground);
 }
 
+.danger-button {
+    background-color: var(--vscode-errorBackground, #5a1d1d);
+    color: var(--vscode-errorForeground, #f48771);
+    border: 1px solid var(--vscode-errorBorder, #f48771);
+}
+
+.danger-button:hover {
+    background-color: var(--vscode-inputValidation-errorBackground, #7a2d2d);
+}
+
 .status-bar {
     margin-top: 4px;
     font-size: 10px;

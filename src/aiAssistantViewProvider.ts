@@ -6,18 +6,36 @@ import * as os from 'os';
 import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
 import * as nodejieba from 'nodejieba';
 import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import * as crypto from 'crypto';
 import Graph from 'graphology';
 
-// 配置
-const LLM_URL = 'http://localhost:8000/api/chat';
-const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
-const LLM_MODEL = 'huggingface-serve';
-const EMBED_MODEL = 'bge-m3';
+// 配置（从VSCode Settings读取，提供默认值）
+const DEFAULT_LLM_BASE_URL = 'http://localhost:8000';
+const DEFAULT_EMBED_BASE_URL = 'http://localhost:11434';
+
+function getConfig<T>(section: string, defaultValue: T): T {
+    const config = vscode.workspace.getConfiguration('aiAssistant');
+    return config.get<T>(section, defaultValue);
+}
+
+function getLlmUrl(): string {
+    const base = getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL);
+    return `${base.replace(/\/+$/, '')}/api/chat`;
+}
+
+function getEmbedUrl(): string {
+    const base = getConfig<string>('embeddingBaseUrl', DEFAULT_EMBED_BASE_URL);
+    return `${base.replace(/\/+$/, '')}/api/embeddings`;
+}
+
+function getLlmModel(): string { return getConfig<string>('llmModel', 'huggingface-serve'); }
+function getEmbedModel(): string { return getConfig<string>('embeddingModel', 'bge-m3'); }
+function shouldAutoStartServer(): boolean { return getConfig<boolean>('autoStartServer', true); }
+
 const RERANKER_MODEL = 'Xenova/bge-reranker-base';
 const CHUNK_SIZE = 800;
 const CHUNK_OVERLAP = 200;
 const CACHE_DIR_NAME = 'resources/documents_xiangliang';
-const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
 const RERANKER_CACHE_DIR = 'reranker_model';
 // 检索参数配置
 const VECTOR_THRESHOLD = 0.3;   // 向量检索预过滤阈值（余弦相似度，bge-m3分布较平，阈值可适当降低）
@@ -37,6 +55,10 @@ const KG_MAX_MATCHED_NODES = 5;   // 最大匹配节点数（防止上下文过�
 const KG_MAX_HOPS = 1;            // 图遍历最大跳数（1跳足够，2跳上下文膨胀严重）
 const KG_MAX_EXPANDED_KW = 8;     // 最大扩展关键词数
 const KG_MAX_CONTEXT_CHARS = 800;  // KG上下文最大字符数
+
+const RERANK_SCORE_WEIGHT = 0.8;   // Rerank分数在最终融合中的权重
+const RRF_SCORE_WEIGHT = 0.2;      // RRF分数在最终融合中的权重
+const LLM_TIMEOUT = 120000;        // LLM调用超时时间(ms)
 
 function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -185,10 +207,19 @@ interface KGContextResult {
     expandedKeywords: string[];
 }
 
+interface LearningSummary {
+    totalQuestions: number;
+    totalSyntaxChecks: number;
+    totalLearningPaths: number;
+    visitedKnowledgeNodes: string[];
+    visitedErrorNodes: string[];
+    weakPoints: string[];
+    lastSessionDate: string;
+}
+
 let docChunks: DocChunk[] = [];
 let docsLoaded = false;
 let modelConnected = false;
-let initCompleted = false;
 let rerankerReady = false;
 let rerankerModel: any = null;
 let rerankerTokenizer: any = null;
@@ -199,22 +230,45 @@ let kgNodesMap: Map<string, KGNodeData> = new Map();
 let kgNameIndex: Map<string, string[]> = new Map();
 let kgLoaded = false;
 
-const LLM_PORT = 8000;
+const GLOBAL_STATE_SUMMARY_KEY = 'learningSummary';
+const MAX_SESSION_HISTORY = 60;
+const MAX_WEAK_POINTS = 10;
+const MAX_VISITED_NODES = 30;
+
+let persistedSummary: LearningSummary = {
+    totalQuestions: 0,
+    totalSyntaxChecks: 0,
+    totalLearningPaths: 0,
+    visitedKnowledgeNodes: [],
+    visitedErrorNodes: [],
+    weakPoints: [],
+    lastSessionDate: ''
+};
+
 const LLM_STARTUP_TIMEOUT = 120;
 const LLM_POLL_INTERVAL = 3000;
 
-export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
+export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     public static readonly viewType = 'aiAssistantView';
     private static currentPanel: vscode.WebviewView | undefined;
     private static selectedCodeContext: { code: string; fileName: string; language: string } | null = null;
+    private static _instance: AiAssistantViewProvider | undefined;
     private readonly _extensionUri: vscode.Uri;
     private readonly _context: vscode.ExtensionContext;
+    private _disposed = false;
     
     constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this._extensionUri = extensionUri;
         this._context = context;
-        // 启动时自动初始化：加载文档 + 检查模型连接
+        AiAssistantViewProvider._instance = this;
         this.initialize();
+    }
+
+    public dispose(): void {
+        if (AiAssistantViewProvider._instance === this) {
+            AiAssistantViewProvider._instance = undefined;
+        }
+        this._disposed = true;
     }
 
     // 初始化：加载文档向量 + 自动启动模型服务 + 加载reranker
@@ -223,6 +277,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         console.log('[RAG]初始化开始');
 
         this.loadKnowledgeGraph();
+        this.loadPersistedData();
 
         await this.loadDocumentsWithEmbeddings();
 
@@ -233,11 +288,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         modelConnected = modelOk;
-        console.log(`[LLM]模型连接: ${LLM_MODEL} ${modelOk ? '--success' : '--fail'}`);
+        console.log(`[LLM]模型连接: ${getLlmModel()} ${modelOk ? '--success' : '--fail'}`);
 
         await this.loadReranker();
-
-        initCompleted = true;
 
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
@@ -255,8 +308,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     // 检查大模型连接
     private async checkModelConnection(): Promise<boolean> {
         try {
-            const data = await ollamaRequest(LLM_URL, {
-                model: LLM_MODEL,
+            const data = await ollamaRequest(getLlmUrl(), {
+                model: getLlmModel(),
                 messages: [{ role: 'user', content: 'hi' }],
                 stream: false
             }, 10000);
@@ -267,6 +320,18 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async startModelServer(): Promise<boolean> {
+        if (!shouldAutoStartServer()) {
+            console.log('[LLM]自动启动已关闭（aiAssistant.autoStartServer=false），跳过');
+            return false;
+        }
+
+        const llmBase = getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL);
+        const isRemote = !llmBase.includes('localhost') && !llmBase.includes('127.0.0.1');
+        if (isRemote) {
+            console.log('[LLM]配置为远程服务，跳过本地启动');
+            return false;
+        }
+
         const serveScript = path.join(this._context.extensionPath, 'finetune', 'serve.py');
         if (!fs.existsSync(serveScript)) {
             console.log('[LLM]serve.py 不存在，跳过自动启动');
@@ -287,7 +352,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         console.log('[LLM]使用基础模型 (base_model)');
 
         try {
-            const args = [serveScript, '--port', String(LLM_PORT), '--base_only'];
+            const llmPort = new URL(getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL)).port || '8000';
+            const args = [serveScript, '--port', llmPort, '--base_only'];
 
             modelServerProcess = spawn(pythonCmd, args, {
                 cwd: path.join(this._context.extensionPath, 'finetune'),
@@ -361,33 +427,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             await new Promise(r => setTimeout(r, LLM_POLL_INTERVAL));
 
             try {
-                const httpReq = http.request({
-                    hostname: 'localhost',
-                    port: LLM_PORT,
-                    path: '/health',
-                    method: 'GET',
-                    timeout: 3000,
-                }, (res) => {
-                    let body = '';
-                    res.on('data', (chunk) => { body += chunk; });
-                    res.on('end', () => {
-                        try {
-                            const data = JSON.parse(body);
-                            if (data.model_loaded) {
-                                return;
-                            }
-                        } catch {}
-                    });
-                });
-                httpReq.on('error', () => {});
-                httpReq.end();
-
                 const ok = await this.checkModelConnection();
                 if (ok) {
                     return true;
                 }
             } catch {
-                // 继续等待
             }
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
@@ -402,6 +446,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             console.log('[LLM]停止模型服务进程...');
             modelServerProcess.kill();
             modelServerProcess = null;
+        }
+    }
+
+    public static async savePersistedData(): Promise<void> {
+        if (AiAssistantViewProvider._instance) {
+            await AiAssistantViewProvider._instance.savePersistedData();
         }
     }
 
@@ -632,16 +682,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         const knowledgeNodes: KGNodeData[] = [];
         const errorNodes: KGNodeData[] = [];
         const solutionNodes: KGNodeData[] = [];
-        const symptomNodes: KGNodeData[] = [];
-        const toolNodes: KGNodeData[] = [];
 
         visited.forEach((entry) => {
             switch (entry.node.type) {
                 case 'knowledge': knowledgeNodes.push(entry.node); break;
                 case 'error': errorNodes.push(entry.node); break;
                 case 'solution': solutionNodes.push(entry.node); break;
-                case 'symptom': symptomNodes.push(entry.node); break;
-                case 'tool': toolNodes.push(entry.node); break;
             }
         });
 
@@ -667,6 +713,13 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             contextText += '\n• 相关错误：';
             for (const err of errorNodes.slice(0, 5)) {
                 contextText += `\n  - ${err.name}`;
+            }
+        }
+
+        if (solutionNodes.length > 0) {
+            contextText += '\n• 相关解决方案：';
+            for (const sol of solutionNodes.slice(0, 5)) {
+                contextText += `\n  - ${sol.name}`;
             }
         }
 
@@ -744,6 +797,91 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         return { expandedKeywords: extraKeywords, kgContext };
     }
 
+    private buildKGNodeInfo(nodeIds: string[]): Array<{ id: string; name: string; type: string }> {
+        return nodeIds.map(id => {
+            const node = kgNodesMap.get(id);
+            if (node) {
+                return { id: node.id, name: node.name, type: node.type };
+            }
+            return { id, name: id, type: 'unknown' };
+        });
+    }
+
+    private loadPersistedData(): void {
+        try {
+            const saved = this._context.globalState.get<LearningSummary>(GLOBAL_STATE_SUMMARY_KEY);
+            if (saved) {
+                persistedSummary = {
+                    totalQuestions: typeof saved.totalQuestions === 'number' ? saved.totalQuestions : 0,
+                    totalSyntaxChecks: typeof saved.totalSyntaxChecks === 'number' ? saved.totalSyntaxChecks : 0,
+                    totalLearningPaths: typeof saved.totalLearningPaths === 'number' ? saved.totalLearningPaths : 0,
+                    visitedKnowledgeNodes: Array.isArray(saved.visitedKnowledgeNodes) ? saved.visitedKnowledgeNodes.filter((v: any) => typeof v === 'string') : [],
+                    visitedErrorNodes: Array.isArray(saved.visitedErrorNodes) ? saved.visitedErrorNodes.filter((v: any) => typeof v === 'string') : [],
+                    weakPoints: Array.isArray(saved.weakPoints) ? saved.weakPoints.filter((v: any) => typeof v === 'string') : [],
+                    lastSessionDate: typeof saved.lastSessionDate === 'string' ? saved.lastSessionDate : ''
+                };
+                console.log(`[持久化] 加载学习摘要: ${persistedSummary.totalQuestions}次提问, ${persistedSummary.visitedKnowledgeNodes.length}个知识点, ${persistedSummary.visitedErrorNodes.length}个错误类型`);
+            }
+        } catch (e) {
+            console.log(`[持久化] 加载失败: ${(e as Error).message}`);
+        }
+    }
+
+    private async savePersistedData(): Promise<void> {
+        try {
+            await this._context.globalState.update(GLOBAL_STATE_SUMMARY_KEY, persistedSummary);
+            console.log(`[持久化] 保存完成: ${persistedSummary.totalQuestions}次提问`);
+        } catch (e) {
+            console.log(`[持久化] 保存失败: ${(e as Error).message}`);
+        }
+    }
+
+    private updateLearningSummary(type: 'question' | 'syntaxCheck' | 'learningPath', kgNodeIds: string[] = []): void {
+        switch (type) {
+            case 'question': persistedSummary.totalQuestions++; break;
+            case 'syntaxCheck': persistedSummary.totalSyntaxChecks++; break;
+            case 'learningPath': persistedSummary.totalLearningPaths++; break;
+        }
+
+        for (const nodeId of kgNodeIds) {
+            const node = kgNodesMap.get(nodeId);
+            if (!node) continue;
+            if (node.type === 'knowledge') {
+                const idx = persistedSummary.visitedKnowledgeNodes.indexOf(node.name);
+                if (idx !== -1) {
+                    persistedSummary.visitedKnowledgeNodes.splice(idx, 1);
+                }
+                persistedSummary.visitedKnowledgeNodes.push(node.name);
+                if (persistedSummary.visitedKnowledgeNodes.length > MAX_VISITED_NODES) {
+                    persistedSummary.visitedKnowledgeNodes.shift();
+                }
+            }
+            if (node.type === 'error') {
+                const veIdx = persistedSummary.visitedErrorNodes.indexOf(node.name);
+                if (veIdx !== -1) {
+                    persistedSummary.visitedErrorNodes.splice(veIdx, 1);
+                }
+                persistedSummary.visitedErrorNodes.push(node.name);
+                if (persistedSummary.visitedErrorNodes.length > MAX_VISITED_NODES) {
+                    persistedSummary.visitedErrorNodes.shift();
+                }
+                const wpIdx = persistedSummary.weakPoints.indexOf(node.name);
+                if (wpIdx !== -1) {
+                    persistedSummary.weakPoints.splice(wpIdx, 1);
+                }
+                persistedSummary.weakPoints.push(node.name);
+                if (persistedSummary.weakPoints.length > MAX_WEAK_POINTS) {
+                    persistedSummary.weakPoints.shift();
+                }
+            }
+        }
+
+        persistedSummary.lastSessionDate = new Date().toISOString().split('T')[0];
+        this.savePersistedData().catch(e => {
+            console.log(`[持久化] 自动保存失败: ${(e as Error).message}`);
+        });
+    }
+
     // 对话历史，初始带系统提示词
     private conversationHistory: Array<{
         role: 'system' | 'user' | 'assistant';
@@ -794,6 +932,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     case 'learningPath':
                         this.handleLearningPath();
                         break;
+                    case 'clearRecords':
+                        this.handleClearRecords();
+                        break;
                 }
             },
             undefined,
@@ -818,11 +959,11 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         console.log('[LLM] ═══════════════════════════════');
 
         try {
-            const data = await ollamaRequest(LLM_URL, {
-                model: LLM_MODEL,
+            const data = await ollamaRequest(getLlmUrl(), {
+                model: getLlmModel(),
                 messages: finalMessages,
                 stream: false
-            }, 120000);
+            }, LLM_TIMEOUT);
             return data.message?.content || '未收到有效响应';
         } catch (e) {
             return '调用大模型失败: ' + (e as Error).message;
@@ -840,7 +981,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
     // 计算单个文件的哈希（基于大小和修改时间）
     private getFileHash(filePath: string): string {
-        const crypto = require('crypto');
         const stats = fs.statSync(filePath);
         const hash = crypto.createHash('md5');
         hash.update(`${path.basename(filePath)}_${stats.size}_${stats.mtimeMs}`);
@@ -890,7 +1030,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 if (fs.existsSync(cacheFile)) {
                     try {
                         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
-                        if (cacheData.hash === fileHash && cacheData.embedModel === EMBED_MODEL && cacheData.chunkSize === CHUNK_SIZE && cacheData.chunkOverlap === CHUNK_OVERLAP && Array.isArray(cacheData.chunks)) {
+                        if (cacheData.hash === fileHash && cacheData.embedModel === getEmbedModel() && cacheData.chunkSize === CHUNK_SIZE && cacheData.chunkOverlap === CHUNK_OVERLAP && Array.isArray(cacheData.chunks)) {
                             newDocChunks.push(...cacheData.chunks);
                             totalChunks += cacheData.chunks.length;
                             cachedCount++;
@@ -927,7 +1067,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 try {
                     const cacheData = {
                         hash: fileHash,
-                        embedModel: EMBED_MODEL,
+                        embedModel: getEmbedModel(),
                         chunkSize: CHUNK_SIZE,
                         chunkOverlap: CHUNK_OVERLAP,
                         chunks: fileChunks,
@@ -955,7 +1095,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const summary = cachedCount > 0 && generatedCount > 0
                 ? `${cachedCount}缓存+${generatedCount}生成`
                 : cachedCount > 0 ? `${cachedCount}缓存` : `${generatedCount}生成`;
-            console.log(`[RAG]向量索引: ${totalChunks} chunks | embed=${EMBED_MODEL} (${summary})--success`);
+            console.log(`[RAG]向量索引: ${totalChunks} chunks | embed=${getEmbedModel()} (${summary})--success`);
         } catch (error) {
             console.error('[RAG]文档加载失败--fail', error);
             docsLoaded = true;
@@ -966,10 +1106,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private async generateEmbedding(text: string, retries: number = 2): Promise<number[]> {
         const attempt = async (remainingRetries: number): Promise<number[]> => {
             try {
-                const data = await ollamaRequest(OLLAMA_EMBED_URL, {
-                    model: EMBED_MODEL,
+                const data = await ollamaRequest(getEmbedUrl(), {
+                    model: getEmbedModel(),
                     prompt: text
-                }, 120000);
+                }, LLM_TIMEOUT);
                 const embedding = data.embedding || [];
                 if (embedding.length === 0) {
                     if (remainingRetries > 0) {
@@ -1313,7 +1453,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 const normalizedRrf = (candidate.rrfScore - minRrf) / rrfRange;
                 return {
                     ...candidate,
-                    rerankScore: normalizedRerank * 0.8 + normalizedRrf * 0.2
+                    rerankScore: normalizedRerank * RERANK_SCORE_WEIGHT + normalizedRrf * RRF_SCORE_WEIGHT
                 };
             });
 
@@ -1382,10 +1522,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             
             let historyContent = `用户问题：${question}`;
 
-            if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
-                const ctx = AiAssistantViewProvider.selectedCodeContext;
-                historyContent += `\n\n用户提供的代码：\n${ctx.code}`;
-                AiAssistantViewProvider.selectedCodeContext = null;
+            const codeCtx = hasContext ? AiAssistantViewProvider.selectedCodeContext : null;
+            if (codeCtx) {
+                historyContent += `\n\n用户提供的代码：\n${codeCtx.code}`;
             } else {
                 historyContent += '\n\n用户提供的代码：空';
             }
@@ -1412,7 +1551,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
             const rawAnswer = await this.callOllama(messagesForLLM);
 
+            if (codeCtx) {
+                AiAssistantViewProvider.selectedCodeContext = null;
+            }
+
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
+            this.trimConversationHistory();
+
+            this.updateLearningSummary('question', kgContext.matchedNodes);
 
             let finalAnswer = rawAnswer;
             const sources: string[] = [];
@@ -1430,7 +1576,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                     response: finalAnswer,
                     hasContext: hasContext,
                     retrievalDetails: ragResult.retrievalDetails || [],
-                    kgMatchedNodes: hasKGContext ? kgContext.matchedNodes : []
+                    kgMatchedNodes: hasKGContext ? this.buildKGNodeInfo(kgContext.matchedNodes) : []
                 });
             }
 
@@ -1510,14 +1656,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 gccAvailable = false;
             }
 
-            const { kgContext } = this.expandQueryWithKG(code.substring(0, 500));
-
             let userContent = `请对以下代码进行全面语法检查：\n\n文件：${fileName}\n语言：${language}\n\n代码：\n\`\`\`c\n${code}\n\`\`\``;
             if (gccAvailable && gccOutput.trim()) {
                 userContent += `\n\nGCC编译器输出：\n\`\`\`\n${gccOutput}\n\`\`\``;
-            }
-            if (kgContext.contextText) {
-                userContent += `\n\n${kgContext.contextText}`;
             }
 
             const messages = [
@@ -1535,8 +1676,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             }
             finalAnswer += '\n\n' + rawAnswer;
 
-            this.conversationHistory.push({ role: 'user', content: `[语法检查] ${fileName}（${checkScope}）` });
+            const historyUserMsg = `用户问题：对代码进行语法检查（${fileName}，${checkScope}）\n\n用户提供的代码：${checkSelected ? '选中代码片段' : '完整文件代码'}\n\n知识图谱关联：空\n\n参考文档：空`;
+            this.conversationHistory.push({ role: 'user', content: historyUserMsg });
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
+            this.trimConversationHistory();
+
+            this.updateLearningSummary('syntaxCheck');
 
             this.postAiResponse(finalAnswer, true, false, 'syntaxCheck');
         } catch (error) {
@@ -1563,18 +1708,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         try {
             const historySummary = this.summarizeHistory();
-            const { expandedKeywords, kgContext } = this.expandQueryWithKG(userInput);
-            const ragResult = await this.retrieveRelevantDocs('C语言学习路径 编程基础 知识点 教程', expandedKeywords);
-            const hasRagDocs = ragResult.fileNames.length > 0;
-            const hasKGContext = kgContext.contextText.length > 0;
 
             let userContent = `学生的学习需求：${userInput}\n\n学习记录：\n${historySummary}`;
-            if (hasKGContext) {
-                userContent += `\n\n${kgContext.contextText}`;
-            }
-            if (hasRagDocs) {
-                userContent += `\n\n${ragResult.contextText}`;
-            }
 
             const messages = [
                 { role: 'system' as const, content: LEARNING_PATH_PROMPT },
@@ -1584,14 +1719,15 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             const rawAnswer = await this.callOllamaWithPrompt(messages);
 
             let finalAnswer = '📚 **个性化学习路径推荐**\n\n' + rawAnswer;
-            if (hasRagDocs) {
-                finalAnswer += `\n\n📖 参考知识库：${ragResult.fileNames.join(', ')}`;
-            }
 
-            this.conversationHistory.push({ role: 'user', content: `[学习路径] ${userInput}` });
+            const historyUserMsg = `用户问题：推荐个性化学习路径 - ${userInput}\n\n用户提供的代码：空\n\n知识图谱关联：空\n\n参考文档：空`;
+            this.conversationHistory.push({ role: 'user', content: historyUserMsg });
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
+            this.trimConversationHistory();
 
-            this.postAiResponse(finalAnswer, false, false, 'learningPath', ragResult.retrievalDetails || []);
+            this.updateLearningSummary('learningPath');
+
+            this.postAiResponse(finalAnswer, false, false, 'learningPath');
         } catch (error) {
             const errorMessage = error instanceof Error ? '错误: ' + error.message : '发生未知错误';
             this.postAiResponse(errorMessage, false, true, 'learningPath');
@@ -1612,11 +1748,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private postAiResponse(response: string, hasContext: boolean, isError: boolean, featureType: string, retrievalDetails?: any[]) {
+    private postAiResponse(response: string, hasContext: boolean, isError: boolean, featureType: string, retrievalDetails?: any[], kgMatchedNodes?: any[]) {
         if (AiAssistantViewProvider.currentPanel) {
             const msg: any = { type: 'aiResponse', response, hasContext, isError, featureType };
             if (retrievalDetails && retrievalDetails.length > 0) {
                 msg.retrievalDetails = retrievalDetails;
+            }
+            if (kgMatchedNodes && kgMatchedNodes.length > 0) {
+                msg.kgMatchedNodes = kgMatchedNodes;
             }
             AiAssistantViewProvider.currentPanel.webview.postMessage(msg);
         }
@@ -1656,31 +1795,46 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     private summarizeHistory(): string {
-        if (this.conversationHistory.length <= 1) {
-            return '暂无学习记录，这是第一次使用AI助教。请根据一般初学者的常见问题进行推荐。';
-        }
+        const sessionItems: string[] = [];
 
-        const items: string[] = [];
-        for (const msg of this.conversationHistory) {
-            if (msg.role === 'user') {
-                const qMatch = msg.content.match(/用户问题：(.*?)(?:\n\n|$)/s);
-                if (qMatch) {
-                    const q = qMatch[1].trim();
-                    const hasCode = msg.content.includes('用户提供的代码：\n') && !msg.content.includes('用户提供的代码：空');
-                    items.push(`- ${q}${hasCode ? '（附代码）' : ''}`);
-                } else if (msg.content.startsWith('[语法检查]')) {
-                    items.push(`- ${msg.content}`);
-                } else if (msg.content.startsWith('[学习路径推荐]')) {
-                    items.push(`- ${msg.content}`);
-                }
+        for (let i = 1; i < this.conversationHistory.length; i++) {
+            const msg = this.conversationHistory[i];
+            if (msg.role !== 'user') continue;
+
+            const qMatch = msg.content.match(/用户问题：(.*?)(?:\n\n|$)/s);
+            if (qMatch) {
+                const q = qMatch[1].trim();
+                const hasCode = msg.content.includes('用户提供的代码：\n') && !msg.content.includes('用户提供的代码：空');
+                sessionItems.push(`- ${q}${hasCode ? '（附代码）' : ''}`);
             }
         }
 
-        if (items.length === 0) {
-            return '暂无学习记录，这是第一次使用AI助教。请根据一般初学者的常见问题进行推荐。';
+        let result = '';
+
+        if (persistedSummary.totalQuestions > 0 || persistedSummary.totalSyntaxChecks > 0 || persistedSummary.totalLearningPaths > 0) {
+            result += `【长期学习统计】\n`;
+            result += `- 累计提问: ${persistedSummary.totalQuestions}次\n`;
+            result += `- 累计语法检查: ${persistedSummary.totalSyntaxChecks}次\n`;
+            result += `- 累计学习路径推荐: ${persistedSummary.totalLearningPaths}次\n`;
+            if (persistedSummary.lastSessionDate) {
+                result += `- 上次使用: ${persistedSummary.lastSessionDate}\n`;
+            }
+            if (persistedSummary.visitedKnowledgeNodes.length > 0) {
+                result += `- 已涉及知识点: ${persistedSummary.visitedKnowledgeNodes.join('、')}\n`;
+            }
+            if (persistedSummary.weakPoints.length > 0) {
+                result += `- 薄弱环节（经常出错的类型）: ${persistedSummary.weakPoints.join('、')}\n`;
+            }
+            result += '\n';
         }
 
-        return `学生的提问记录（共${items.length}条）：\n${items.join('\n')}`;
+        if (sessionItems.length > 0) {
+            result += `【本次会话提问记录】（共${sessionItems.length}条）\n${sessionItems.join('\n')}`;
+        } else if (persistedSummary.totalQuestions === 0) {
+            result += '暂无学习记录，这是第一次使用AI助教。请根据一般初学者的常见问题进行推荐。';
+        }
+
+        return result || '暂无学习记录。';
     }
 
     private async callOllamaWithPrompt(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
@@ -1692,27 +1846,78 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            const data = await ollamaRequest(LLM_URL, {
-                model: LLM_MODEL,
+            const data = await ollamaRequest(getLlmUrl(), {
+                model: getLlmModel(),
                 messages: messages,
                 stream: false
-            }, 120000);
+            }, LLM_TIMEOUT);
             return data.message?.content || '未收到有效响应';
         } catch (e) {
             return '调用大模型失败: ' + (e as Error).message;
         }
     }
 
+    private trimConversationHistory(): void {
+        const maxLen = MAX_SESSION_HISTORY + 1;
+        if (this.conversationHistory.length <= maxLen) {
+            return;
+        }
+        while (this.conversationHistory.length > maxLen) {
+            if (this.conversationHistory.length <= 2) break;
+            const second = this.conversationHistory[1];
+            const third = this.conversationHistory[2];
+            if (second.role === 'user' && third && third.role === 'assistant') {
+                this.conversationHistory.splice(1, 2);
+            } else {
+                this.conversationHistory.splice(1, 1);
+            }
+        }
+    }
+
     private handleClearChat() {
         AiAssistantViewProvider.selectedCodeContext = null;
-        this.conversationHistory = [ // 重置为系统提示词
+        const oldLen = this.conversationHistory.length;
+        this.conversationHistory = [
             { role: 'system', content: SYSTEM_PROMPT }
         ];
+        console.log(`[会话] 清空对话历史: ${oldLen}条 → ${this.conversationHistory.length}条`);
+        this.savePersistedData().catch(e => {
+            console.log(`[持久化] 清空保存失败: ${(e as Error).message}`);
+        });
         if (AiAssistantViewProvider.currentPanel) {
             AiAssistantViewProvider.currentPanel.webview.postMessage({
                 type: 'clearChat'
             });
         }
+    }
+
+    private async handleClearRecords() {
+        const confirm = await vscode.window.showWarningMessage(
+            '确定要清空所有学习记录吗？此操作不可撤销。',
+            { modal: true },
+            '确定清空'
+        );
+        if (confirm !== '确定清空') {
+            return;
+        }
+        persistedSummary = {
+            totalQuestions: 0,
+            totalSyntaxChecks: 0,
+            totalLearningPaths: 0,
+            visitedKnowledgeNodes: [],
+            visitedErrorNodes: [],
+            weakPoints: [],
+            lastSessionDate: ''
+        };
+        this.savePersistedData().catch(e => {
+            console.log(`[持久化] 清空记录保存失败: ${(e as Error).message}`);
+        });
+        if (AiAssistantViewProvider.currentPanel) {
+            AiAssistantViewProvider.currentPanel.webview.postMessage({
+                type: 'recordsCleared'
+            });
+        }
+        vscode.window.showInformationMessage('学习记录已清空');
     }
 
     public static createOrShow(extensionUri: vscode.Uri) {
@@ -1796,7 +2001,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                         <textarea id="question-input" placeholder="输入你的编程问题..." rows="3"></textarea>
                         <div class="button-container">
                             <button id="ask-button" class="primary-button">发送</button>
-                            <button id="clear-button" class="secondary-button">清空</button>
+                            <button id="clear-button" class="secondary-button">清空对话</button>
+                            <button id="clear-records-btn" class="secondary-button danger-button">清空记录</button>
                         </div>
                     </div>
                     

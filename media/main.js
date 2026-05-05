@@ -5,6 +5,7 @@
     const questionInput = document.getElementById('question-input');
     const askButton = document.getElementById('ask-button');
     const clearButton = document.getElementById('clear-button');
+    const clearRecordsBtn = document.getElementById('clear-records-btn');
     const statusElement = document.getElementById('status');
     const codeContext = document.getElementById('code-context');
     const selectedCodeEl = document.getElementById('selected-code');
@@ -257,14 +258,13 @@
         const typeLabels = { knowledge: '知识点', error: '错误类型', solution: '解决方案', symptom: '症状', tool: '工具' };
         const typeColors = { knowledge: '#4fc3f7', error: '#ef5350', solution: '#66bb6a', symptom: '#ffa726', tool: '#ab47bc' };
 
-        matchedNodes.forEach((nodeId) => {
+        matchedNodes.forEach((nodeInfo) => {
             const nodeDiv = document.createElement('div');
             nodeDiv.className = 'kg-node';
 
             const badge = document.createElement('span');
             badge.className = 'kg-node-badge';
-            const prefix = nodeId.split('_')[0];
-            const nodeType = prefix === 'kp' ? 'knowledge' : prefix === 'err' ? 'error' : prefix === 'sol' ? 'solution' : prefix === 'sym' ? 'symptom' : 'tool';
+            const nodeType = nodeInfo.type || 'unknown';
             badge.textContent = typeLabels[nodeType] || nodeType;
             badge.style.backgroundColor = typeColors[nodeType] || '#888';
             badge.style.color = '#fff';
@@ -274,7 +274,7 @@
             badge.style.marginRight = '6px';
 
             const nameSpan = document.createElement('span');
-            nameSpan.textContent = nodeId;
+            nameSpan.textContent = nodeInfo.name || nodeInfo.id;
 
             nodeDiv.appendChild(badge);
             nodeDiv.appendChild(nameSpan);
@@ -331,7 +331,7 @@
 
     function clearChat() {
         chatMessages.innerHTML = '';
-        statusElement.textContent = 'Chat cleared';
+        statusElement.textContent = '本次会话已清空';
     }
 
     function sendQuestion() {
@@ -352,9 +352,13 @@
 
     askButton.addEventListener('click', sendQuestion);
     clearButton.addEventListener('click', () => {
-        clearChat();
         vscode.postMessage({ type: 'clearChat' });
     });
+    if (clearRecordsBtn) {
+        clearRecordsBtn.addEventListener('click', () => {
+            vscode.postMessage({ type: 'clearRecords' });
+        });
+    }
     clearContextBtn.addEventListener('click', () => {
         hasSelectedCode = false;
         codeContext.style.display = 'none';
@@ -394,6 +398,12 @@
                 break;
             case 'loading':
                 setLoading(message.isLoading);
+                break;
+            case 'clearChat':
+                clearChat();
+                break;
+            case 'recordsCleared':
+                statusElement.textContent = '学习记录已清空';
                 break;
             case 'userAction':
                 addMessage(message.text, true);

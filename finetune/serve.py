@@ -7,8 +7,10 @@ HuggingFace 模型推理服务
   python serve.py --base_only                  # 仅使用原始基础模型
   python serve.py --lora output/final          # 动态加载LoRA（不推荐，较慢）
   python serve.py --port 8000                  # 指定端口
+  python serve.py --host 0.0.0.0               # 指定监听地址（默认0.0.0.0，允许远程访问）
+  python serve.py --workers 2                  # 并发推理线程数（默认1，受GPU显存限制）
 
-启动后，插件只需将 OLLAMA_URL 改为 http://localhost:8000/api/chat
+启动后，插件只需将 aiAssistant.llmBaseUrl 改为 http://服务器IP:端口
 """
 
 import os
@@ -16,7 +18,9 @@ import sys
 import json
 import argparse
 import time
+import asyncio
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -30,6 +34,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MERGED_MODEL = os.path.join(SCRIPT_DIR, "merged_model")
 DEFAULT_BASE_MODEL = os.path.join(SCRIPT_DIR, "base_model")
 DEFAULT_PORT = 8000
+DEFAULT_HOST = "0.0.0.0"
 
 app = FastAPI(title="HuggingFace LLM Serve (Ollama-compatible)")
 
@@ -42,6 +47,7 @@ app.add_middleware(
 
 model = None
 tokenizer = None
+executor = None
 
 
 class ChatMessage(BaseModel):
@@ -63,14 +69,8 @@ class ChatResponse(BaseModel):
     done: bool = True
 
 
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
+def _generate(messages_dict: list, gen_kwargs: dict) -> str:
     global model, tokenizer
-
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
 
     text = tokenizer.apply_chat_template(
         messages_dict,
@@ -78,6 +78,28 @@ async def chat(request: ChatRequest):
         add_generation_prompt=True,
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            **gen_kwargs,
+        )
+
+    response_text = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+    return response_text
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest):
+    global model, tokenizer, executor
+
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
 
     gen_kwargs = {
         "max_new_tokens": 1024,
@@ -95,16 +117,13 @@ async def chat(request: ChatRequest):
         if "num_predict" in request.options:
             gen_kwargs["max_new_tokens"] = request.options["num_predict"]
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            **gen_kwargs,
+    if executor is not None:
+        loop = asyncio.get_running_loop()
+        response_text = await loop.run_in_executor(
+            executor, _generate, messages_dict, gen_kwargs
         )
-
-    response_text = tokenizer.decode(
-        outputs[0][inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True,
-    )
+    else:
+        response_text = _generate(messages_dict, gen_kwargs)
 
     return ChatResponse(
         model=request.model or "huggingface-serve",
@@ -181,6 +200,10 @@ if __name__ == "__main__":
     parser.add_argument("--lora", type=str, default=None,
                         help="Path to LoRA weights (e.g. output/final)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", type=str, default=DEFAULT_HOST,
+                        help="Host to bind (default: 0.0.0.0, allows remote access)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of concurrent inference threads (default: 1)")
     args = parser.parse_args()
 
     if args.base_only:
@@ -200,18 +223,26 @@ if __name__ == "__main__":
         print(f"ERROR: Model not found at: {model_path}")
         sys.exit(1)
 
+    if args.workers > 1:
+        executor = ThreadPoolExecutor(max_workers=args.workers)
+        print(f"Concurrent inference enabled: {args.workers} workers")
+
     print("=" * 60)
     print("  HuggingFace LLM Serve (Ollama-compatible)")
     print(f"  Model:    {model_desc}")
     print(f"  Path:     {model_path}")
+    print(f"  Host:     {args.host}")
     print(f"  Port:     {args.port}")
-    print(f"  Endpoint: http://localhost:{args.port}/api/chat")
+    print(f"  Workers:  {args.workers}")
+    print(f"  Endpoint: http://{args.host}:{args.port}/api/chat")
     print("=" * 60)
 
     load_model(model_path, args.lora)
 
-    print(f"\nServer starting at http://localhost:{args.port}")
-    print(f"Ollama-compatible endpoint: http://localhost:{args.port}/api/chat")
+    print(f"\nServer starting at http://{args.host}:{args.port}")
+    print(f"Ollama-compatible endpoint: http://{args.host}:{args.port}/api/chat")
+    if args.host == "0.0.0.0":
+        print("Listening on all interfaces - remote devices can connect")
     print("\nPress Ctrl+C to stop.\n")
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

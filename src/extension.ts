@@ -63,12 +63,14 @@ export function activate(context: vscode.ExtensionContext) {
     // Register the webview view provider
     const provider = new AiAssistantViewProvider(context.extensionUri, context);
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(AiAssistantViewProvider.viewType, provider)
+        vscode.window.registerWebviewViewProvider(AiAssistantViewProvider.viewType, provider),
+        provider
     );
 
     context.subscriptions.push(helloWorld, showPanel, analyzeCode, syntaxCheck, learningPath);
 }
 
-export function deactivate() {
+export function deactivate(): Promise<void> | undefined {
     AiAssistantViewProvider.stopModelServer();
+    return AiAssistantViewProvider.savePersistedData();
 }

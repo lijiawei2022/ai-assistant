@@ -81,6 +81,7 @@
     {"id": "err_strcpy_unsafe", "type": "error", "name": "strcpy不安全使用", "aliases": ["strcpy溢出", "不安全字符串拷贝"], "description": "strcpy未检查目标缓冲区大小可能导致溢出"},
     {"id": "err_link_math", "type": "error", "name": "链接数学库错误", "aliases": ["undefined reference to sqrt", "缺少-lm", "数学库链接"], "description": "使用math.h函数但编译时未链接数学库"},
     {"id": "err_goto_missing", "type": "error", "name": "错误处理缺失", "aliases": ["缺少错误处理", "未处理错误", "资源泄漏"], "description": "函数中缺少统一的错误处理和资源清理逻辑"},
+    {"id": "err_struct_alignment_issue", "type": "error", "name": "结构体对齐问题", "aliases": ["对齐错误", "padding问题", "结构体大小不符"], "description": "因内存对齐规则导致结构体大小与预期不符或数据访问异常"},
 
     {"id": "sol_init_null", "type": "solution", "name": "声明时初始化指针为NULL", "aliases": ["初始化为NULL", "指针初始化", "int *p = NULL"], "description": "声明指针时立即初始化为NULL避免野指针"},
     {"id": "sol_check_null", "type": "solution", "name": "使用前检查NULL", "aliases": ["空指针检查", "if(p != NULL)", "指针有效性检查"], "description": "解引用指针前检查是否为NULL"},
@@ -165,7 +166,6 @@
     {"source": "kp_function", "target": "kp_multi_file", "relation": "prerequisite"},
     {"source": "kp_data_type", "target": "kp_bit_operation", "relation": "prerequisite"},
     {"source": "kp_function", "target": "kp_variadic", "relation": "prerequisite"},
-    {"source": "kp_pointer", "target": "kp_function_pointer", "relation": "prerequisite"},
     {"source": "kp_function", "target": "kp_command_line", "relation": "prerequisite"},
     {"source": "kp_pointer", "target": "kp_command_line", "relation": "prerequisite"},
     {"source": "kp_basics", "target": "kp_preprocessor", "relation": "prerequisite"},
@@ -227,7 +227,7 @@
     {"source": "err_strcpy_unsafe", "target": "kp_string", "relation": "belongs_to"},
     {"source": "err_link_math", "target": "kp_multi_file", "relation": "belongs_to"},
     {"source": "err_goto_missing", "target": "kp_function", "relation": "belongs_to"},
-    {"source": "err_struct_alignment", "target": "kp_struct_alignment", "relation": "belongs_to"},
+    {"source": "err_struct_alignment_issue", "target": "kp_struct_alignment", "relation": "belongs_to"},
 
     {"source": "err_wild_pointer", "target": "sym_segfault", "relation": "causes"},
     {"source": "err_wild_pointer", "target": "sym_undefined_behavior", "relation": "causes"},
@@ -287,7 +287,7 @@
     {"source": "err_link_math", "target": "sym_link_error", "relation": "causes"},
     {"source": "err_goto_missing", "target": "sym_memory_growth", "relation": "causes"},
     {"source": "err_goto_missing", "target": "sym_runtime_crash", "relation": "causes"},
-    {"source": "err_struct_alignment", "target": "sym_wrong_result", "relation": "causes"},
+    {"source": "err_struct_alignment_issue", "target": "sym_wrong_result", "relation": "causes"},
 
     {"source": "sol_init_null", "target": "err_wild_pointer", "relation": "fixes"},
     {"source": "sol_check_null", "target": "err_null_dereference", "relation": "fixes"},
@@ -371,7 +371,7 @@
     {"source": "err_format_vulnerability", "target": "err_format_string", "relation": "related_to"},
     {"source": "err_return_local_address", "target": "err_dangling_pointer", "relation": "related_to"},
     {"source": "err_modify_string_literal", "target": "err_dangling_pointer", "relation": "related_to"},
-    {"source": "err_struct_alignment", "target": "err_sizeof_array_decay", "relation": "related_to"},
+    {"source": "err_struct_alignment_issue", "target": "err_sizeof_array_decay", "relation": "related_to"},
     {"source": "err_release_debug", "target": "err_uninitialized_var", "relation": "related_to"}
   ]
 }
