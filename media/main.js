@@ -138,7 +138,7 @@
         statusElement.textContent = 'Code context loaded';
     }
 
-    function addMessage(text, isUser, isError, retrievalDetails, featureType, llmMessages) {
+    function addMessage(text, isUser, isError, retrievalDetails, featureType, llmMessages, kgMatchedNodes) {
         const messageDiv = document.createElement('div');
         let className = 'message ' + (isUser ? 'user-message' : 'ai-message');
         if (isError) className += ' error-message';
@@ -172,6 +172,11 @@
         }
 
         body.appendChild(content);
+
+        if (!isUser && kgMatchedNodes && kgMatchedNodes.length > 0) {
+            const kgPanel = createKGPanel(kgMatchedNodes);
+            body.appendChild(kgPanel);
+        }
 
         if (!isUser && retrievalDetails && retrievalDetails.length > 0) {
             const debugPanel = createDebugPanel(retrievalDetails);
@@ -230,6 +235,50 @@
             docDiv.appendChild(headerDiv);
             docDiv.appendChild(contentDiv);
             content.appendChild(docDiv);
+        });
+
+        panel.appendChild(summary);
+        panel.appendChild(content);
+        return panel;
+    }
+
+    function createKGPanel(matchedNodes) {
+        const panel = document.createElement('details');
+        panel.className = 'debug-panel kg-panel';
+        panel.open = false;
+
+        const summary = document.createElement('summary');
+        summary.className = 'debug-summary';
+        summary.textContent = `知识图谱匹配 (${matchedNodes.length} 个节点)`;
+
+        const content = document.createElement('div');
+        content.className = 'debug-content';
+
+        const typeLabels = { knowledge: '知识点', error: '错误类型', solution: '解决方案', symptom: '症状', tool: '工具' };
+        const typeColors = { knowledge: '#4fc3f7', error: '#ef5350', solution: '#66bb6a', symptom: '#ffa726', tool: '#ab47bc' };
+
+        matchedNodes.forEach((nodeId) => {
+            const nodeDiv = document.createElement('div');
+            nodeDiv.className = 'kg-node';
+
+            const badge = document.createElement('span');
+            badge.className = 'kg-node-badge';
+            const prefix = nodeId.split('_')[0];
+            const nodeType = prefix === 'kp' ? 'knowledge' : prefix === 'err' ? 'error' : prefix === 'sol' ? 'solution' : prefix === 'sym' ? 'symptom' : 'tool';
+            badge.textContent = typeLabels[nodeType] || nodeType;
+            badge.style.backgroundColor = typeColors[nodeType] || '#888';
+            badge.style.color = '#fff';
+            badge.style.padding = '1px 6px';
+            badge.style.borderRadius = '3px';
+            badge.style.fontSize = '11px';
+            badge.style.marginRight = '6px';
+
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = nodeId;
+
+            nodeDiv.appendChild(badge);
+            nodeDiv.appendChild(nameSpan);
+            content.appendChild(nodeDiv);
         });
 
         panel.appendChild(summary);
@@ -337,7 +386,7 @@
         const message = event.data;
         switch (message.type) {
             case 'aiResponse':
-                addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType, message.llmMessages);
+                addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType, message.llmMessages, message.kgMatchedNodes);
                 statusElement.textContent = 'Response received';
                 break;
             case 'selectedCode':

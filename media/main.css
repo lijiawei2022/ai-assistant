@@ -550,3 +550,19 @@ header p {
     max-height: none;
     overflow: visible;
 }
+
+.kg-panel .debug-summary {
+    color: var(--vscode-charts-purple, #ab47bc);
+}
+
+.kg-node {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    font-size: 12px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.1));
+}
+
+.kg-node:last-child {
+    border-bottom: none;
+}

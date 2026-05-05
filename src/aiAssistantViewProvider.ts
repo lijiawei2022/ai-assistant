@@ -6,6 +6,7 @@ import * as os from 'os';
 import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
 import * as nodejieba from 'nodejieba';
 import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import Graph from 'graphology';
 
 // 配置
 const LLM_URL = 'http://localhost:8000/api/chat';
@@ -24,10 +25,18 @@ const BM25_MIN_SCORE = 0.1;      // BM25最小分数阈值（过滤明显不相�
 const RRF_K = 60;                // RRF公式中的k值（标准值为60）
 const RRF_TOP_K = 10;            // RRF选出候选数（交叉编码器rerank开销大，10个候选足够）
 const RERANK_TOP_K = 5;          // rerank后最终返回数量
+const RRF_VECTOR_WEIGHT = 0.7;   // 向量检索在RRF中的权重（KG扩展词已增强BM25，向量权重适当提高）
+const RRF_KEYWORD_WEIGHT = 0.3;  // 关键词检索在RRF中的权重
 
 // BM25参数
 const BM25_K1 = 1.5;              // 词频饱和参数（标准值1.2-2.0）
 const BM25_B = 0.75;              // 文档长度归一化参数（标准值0.75）
+
+// 知识图谱参数
+const KG_MAX_MATCHED_NODES = 5;   // 最大匹配节点数（防止上下文过长）
+const KG_MAX_HOPS = 1;            // 图遍历最大跳数（1跳足够，2跳上下文膨胀严重）
+const KG_MAX_EXPANDED_KW = 8;     // 最大扩展关键词数
+const KG_MAX_CONTEXT_CHARS = 800;  // KG上下文最大字符数
 
 function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -70,17 +79,20 @@ function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<an
 const SYSTEM_PROMPT = `你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。熟悉C语言等主流编程语言，精通数据结构、算法、软件工程等核心知识。
 
 ## 输入格式
-每条用户消息固定包含以下三部分（某部分为"空"表示未提供）：
+每条用户消息固定包含以下四部分（某部分为"空"表示未提供）：
 - 用户问题：用户的核心诉求
 - 用户提供的代码：用户选中的代码片段
-- 参考文档：从知识库检索的相关文档
+- 知识图谱关联：从知识图谱检索的结构化关联信息（知识点层级、错误-原因-解决方案的因果链）
+- 参考文档：从知识库检索的相关文档片段
 
 ## 回答要求
-1. 优先依据参考文档作答，文档不足或不相关时基于专业知识回答
-2. 用户提供的代码不为空时，结合代码实际情况分析问题，将文档知识与代码对应
-3. 简洁精准，直接回答核心问题
-4. 必要时提供完整可运行的代码示例（用代码块包裹）
-5. 使用简洁中文，专业术语保留英文原文`;
+1. 优先依据知识图谱关联理解问题的上下文关系，再结合参考文档获取详细内容
+2. 知识图谱关联不为空时，按图谱中的因果链和解决方案链组织回答结构
+3. 参考文档不为空时，用文档内容充实回答的细节
+4. 用户提供的代码不为空时，结合代码实际情况分析问题，将文档知识与代码对应
+5. 简洁精准，直接回答核心问题
+6. 必要时提供完整可运行的代码示例（用代码块包裹）
+7. 使用简洁中文，专业术语保留英文原文`;
 
 const SYNTAX_CHECK_PROMPT = `你是C语言代码审查专家。请对用户提供的代码进行全面检查。
 
@@ -153,6 +165,26 @@ interface RetrievalResult {
     rankKeyword?: number;
 }
 
+interface KGNodeData {
+    id: string;
+    type: 'knowledge' | 'error' | 'solution' | 'symptom' | 'tool';
+    name: string;
+    aliases: string[];
+    description: string;
+    level?: string;
+}
+
+interface KGEdgeData {
+    relation: string;
+    weight?: number;
+}
+
+interface KGContextResult {
+    contextText: string;
+    matchedNodes: string[];
+    expandedKeywords: string[];
+}
+
 let docChunks: DocChunk[] = [];
 let docsLoaded = false;
 let modelConnected = false;
@@ -161,6 +193,11 @@ let rerankerReady = false;
 let rerankerModel: any = null;
 let rerankerTokenizer: any = null;
 let modelServerProcess: ChildProcess | null = null;
+
+let kgGraph: Graph | null = null;
+let kgNodesMap: Map<string, KGNodeData> = new Map();
+let kgNameIndex: Map<string, string[]> = new Map();
+let kgLoaded = false;
 
 const LLM_PORT = 8000;
 const LLM_STARTUP_TIMEOUT = 120;
@@ -184,6 +221,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     private async initialize(): Promise<void> {
         const startTime = Date.now();
         console.log('[RAG]初始化开始');
+
+        this.loadKnowledgeGraph();
 
         await this.loadDocumentsWithEmbeddings();
 
@@ -210,7 +249,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[RAG]初始化完成 [Model ${modelConnected ? 'OK' : '--'} | ${docChunks.length} chunks | Reranker ${rerankerReady ? 'OK' : '--'}] ${elapsed}s`);
+        console.log(`[RAG]初始化完成 [Model ${modelConnected ? 'OK' : '--'} | ${docChunks.length} chunks | Reranker ${rerankerReady ? 'OK' : '--'} | KG ${kgLoaded ? kgGraph?.order + '节点' : '--'}] ${elapsed}s`);
     }
 
     // 检查大模型连接
@@ -405,6 +444,304 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             console.log(`[RAG]Reranker 加载失败: ${(e as Error).message}--fail`);
             rerankerReady = false;
         }
+    }
+
+    private loadKnowledgeGraph(): void {
+        if (kgLoaded) {
+            return;
+        }
+
+        try {
+            const kgPath = path.join(this._context.extensionPath, 'knowledge_graph.json');
+            if (!fs.existsSync(kgPath)) {
+                console.log('[KG]知识图谱文件不存在--fail');
+                kgLoaded = true;
+                return;
+            }
+
+            const rawData = JSON.parse(fs.readFileSync(kgPath, 'utf-8'));
+            const nodes: any[] = rawData.nodes || [];
+            const edges: any[] = rawData.edges || [];
+
+            const graph = new Graph({ type: 'directed', multi: false });
+
+            for (const node of nodes) {
+                graph.addNode(node.id, {
+                    type: node.type,
+                    name: node.name,
+                    aliases: node.aliases || [],
+                    description: node.description || '',
+                    level: node.level || ''
+                });
+                kgNodesMap.set(node.id, {
+                    id: node.id,
+                    type: node.type,
+                    name: node.name,
+                    aliases: node.aliases || [],
+                    description: node.description || '',
+                    level: node.level
+                });
+
+                const namesToIndex = [node.name, ...(node.aliases || [])];
+                for (const name of namesToIndex) {
+                    const key = name.toLowerCase().trim();
+                    if (key.length === 0) continue;
+                    if (!kgNameIndex.has(key)) {
+                        kgNameIndex.set(key, []);
+                    }
+                    kgNameIndex.get(key)!.push(node.id);
+                }
+            }
+
+            let edgeCount = 0;
+            for (const edge of edges) {
+                try {
+                    graph.addEdge(edge.source, edge.target, {
+                        relation: edge.relation,
+                        weight: edge.weight || 1.0
+                    });
+                    edgeCount++;
+                } catch {
+                    // skip duplicate or invalid edges
+                }
+            }
+
+            kgGraph = graph;
+            kgLoaded = true;
+
+            const typeCounts: Record<string, number> = {};
+            for (const node of nodes) {
+                typeCounts[node.type] = (typeCounts[node.type] || 0) + 1;
+            }
+            const typeSummary = Object.entries(typeCounts).map(([t, c]) => `${t}=${c}`).join(', ');
+            console.log(`[KG]知识图谱: ${nodes.length}节点(${typeSummary}) | ${edgeCount}边--success`);
+        } catch (e) {
+            console.log(`[KG]知识图谱加载失败: ${(e as Error).message}--fail`);
+            kgLoaded = true;
+        }
+    }
+
+    private matchKGEntities(keywords: string[]): string[] {
+        if (!kgLoaded || !kgGraph || keywords.length === 0) {
+            return [];
+        }
+
+        const matchedIds = new Set<string>();
+
+        for (const keyword of keywords) {
+            const key = keyword.toLowerCase().trim();
+            if (key.length === 0) continue;
+
+            const directMatch = kgNameIndex.get(key);
+            if (directMatch) {
+                for (const id of directMatch) {
+                    matchedIds.add(id);
+                }
+            }
+
+            if (matchedIds.size >= KG_MAX_MATCHED_NODES) break;
+
+            kgNameIndex.forEach((nodeIds, nameKey) => {
+                if (matchedIds.size >= KG_MAX_MATCHED_NODES) return;
+                if (nameKey !== key && (nameKey.includes(key) || key.includes(nameKey))) {
+                    for (const id of nodeIds) {
+                        matchedIds.add(id);
+                        if (matchedIds.size >= KG_MAX_MATCHED_NODES) return;
+                    }
+                }
+            });
+        }
+
+        return [...matchedIds].slice(0, KG_MAX_MATCHED_NODES);
+    }
+
+    private traverseKG(matchedNodeIds: string[], maxHops: number = KG_MAX_HOPS): {
+        visited: Map<string, { node: KGNodeData; hops: number; path: string[] }>;
+        edges: Array<{ source: string; target: string; relation: string }>
+    } {
+        if (!kgLoaded || !kgGraph || matchedNodeIds.length === 0) {
+            return { visited: new Map(), edges: [] };
+        }
+
+        const visited = new Map<string, { node: KGNodeData; hops: number; path: string[] }>();
+        const collectedEdges: Array<{ source: string; target: string; relation: string }> = [];
+        const queue: Array<{ id: string; hops: number; path: string[] }> = [];
+
+        for (const id of matchedNodeIds) {
+            if (kgGraph.hasNode(id) && !visited.has(id)) {
+                const nodeData = kgNodesMap.get(id)!;
+                visited.set(id, { node: nodeData, hops: 0, path: [id] });
+                queue.push({ id, hops: 0, path: [id] });
+            }
+        }
+
+        while (queue.length > 0) {
+            const current = queue.shift()!;
+
+            if (current.hops >= maxHops) continue;
+
+            const outEdges = kgGraph.outEdges(current.id);
+            if (outEdges) {
+                for (const edge of outEdges) {
+                    const target = kgGraph.target(edge);
+                    const attrs = kgGraph.getEdgeAttributes(edge) as KGEdgeData;
+                    collectedEdges.push({ source: current.id, target, relation: attrs.relation });
+
+                    if (!visited.has(target)) {
+                        const targetData = kgNodesMap.get(target);
+                        if (targetData) {
+                            visited.set(target, { node: targetData, hops: current.hops + 1, path: [...current.path, target] });
+                            queue.push({ id: target, hops: current.hops + 1, path: [...current.path, target] });
+                        }
+                    }
+                }
+            }
+
+            const inEdges = kgGraph.inEdges(current.id);
+            if (inEdges) {
+                for (const edge of inEdges) {
+                    const source = kgGraph.source(edge);
+                    const attrs = kgGraph.getEdgeAttributes(edge) as KGEdgeData;
+                    collectedEdges.push({ source, target: current.id, relation: attrs.relation });
+
+                    if (!visited.has(source)) {
+                        const sourceData = kgNodesMap.get(source);
+                        if (sourceData) {
+                            visited.set(source, { node: sourceData, hops: current.hops + 1, path: [...current.path, source] });
+                            queue.push({ id: source, hops: current.hops + 1, path: [...current.path, source] });
+                        }
+                    }
+                }
+            }
+        }
+
+        return { visited, edges: collectedEdges };
+    }
+
+    private generateKGContext(matchedNodeIds: string[]): KGContextResult {
+        if (!kgLoaded || !kgGraph || matchedNodeIds.length === 0) {
+            return { contextText: '', matchedNodes: [], expandedKeywords: [] };
+        }
+
+        const { visited, edges } = this.traverseKG(matchedNodeIds, KG_MAX_HOPS);
+
+        if (visited.size === 0) {
+            return { contextText: '', matchedNodes: [], expandedKeywords: [] };
+        }
+
+        const knowledgeNodes: KGNodeData[] = [];
+        const errorNodes: KGNodeData[] = [];
+        const solutionNodes: KGNodeData[] = [];
+        const symptomNodes: KGNodeData[] = [];
+        const toolNodes: KGNodeData[] = [];
+
+        visited.forEach((entry) => {
+            switch (entry.node.type) {
+                case 'knowledge': knowledgeNodes.push(entry.node); break;
+                case 'error': errorNodes.push(entry.node); break;
+                case 'solution': solutionNodes.push(entry.node); break;
+                case 'symptom': symptomNodes.push(entry.node); break;
+                case 'tool': toolNodes.push(entry.node); break;
+            }
+        });
+
+        const expandedKeywords = new Set<string>();
+        visited.forEach((entry) => {
+            expandedKeywords.add(entry.node.name);
+            for (const alias of entry.node.aliases) {
+                expandedKeywords.add(alias);
+            }
+        });
+
+        let contextText = '知识图谱关联：';
+
+        if (knowledgeNodes.length > 0) {
+            contextText += '\n• 涉及知识点：';
+            for (const kn of knowledgeNodes.slice(0, 5)) {
+                const levelStr = kn.level ? `（${kn.level}）` : '';
+                contextText += `\n  - ${kn.name}${levelStr}`;
+            }
+        }
+
+        if (errorNodes.length > 0) {
+            contextText += '\n• 相关错误：';
+            for (const err of errorNodes.slice(0, 5)) {
+                contextText += `\n  - ${err.name}`;
+            }
+        }
+
+        const causesEdges = edges.filter(e => e.relation === 'causes').slice(0, 5);
+        if (causesEdges.length > 0) {
+            contextText += '\n• 因果链：';
+            for (const edge of causesEdges) {
+                const srcNode = kgNodesMap.get(edge.source);
+                const tgtNode = kgNodesMap.get(edge.target);
+                if (srcNode && tgtNode) {
+                    contextText += `\n  - ${srcNode.name} → 导致 → ${tgtNode.name}`;
+                }
+            }
+        }
+
+        const fixesEdges = edges.filter(e => e.relation === 'fixes').slice(0, 5);
+        const detectsEdges = edges.filter(e => e.relation === 'detects').slice(0, 3);
+        const allFixEdges = [...fixesEdges, ...detectsEdges];
+        if (allFixEdges.length > 0) {
+            contextText += '\n• 解决方案：';
+            for (const edge of allFixEdges) {
+                const srcNode = kgNodesMap.get(edge.source);
+                const tgtNode = kgNodesMap.get(edge.target);
+                if (srcNode && tgtNode) {
+                    const label = edge.relation === 'fixes' ? '修复' : '检测';
+                    contextText += `\n  - ${srcNode.name}（${label} ${tgtNode.name}）`;
+                }
+            }
+        }
+
+        const prereqEdges = edges.filter(e => e.relation === 'prerequisite').slice(0, 3);
+        if (prereqEdges.length > 0) {
+            contextText += '\n• 前置知识：';
+            for (const edge of prereqEdges) {
+                const srcNode = kgNodesMap.get(edge.source);
+                const tgtNode = kgNodesMap.get(edge.target);
+                if (srcNode && tgtNode) {
+                    contextText += `\n  - ${srcNode.name} → ${tgtNode.name}的前置`;
+                }
+            }
+        }
+
+        if (contextText.length > KG_MAX_CONTEXT_CHARS) {
+            contextText = contextText.substring(0, KG_MAX_CONTEXT_CHARS) + '...';
+        }
+
+        const limitedKeywords = [...expandedKeywords].slice(0, KG_MAX_EXPANDED_KW);
+
+        console.log(`[KG] 匹配节点=${matchedNodeIds.length} | 遍历节点=${visited.size} | 关联边=${edges.length} | 扩展词=${limitedKeywords.length} | 上下文=${contextText.length}字`);
+
+        return {
+            contextText,
+            matchedNodes: matchedNodeIds,
+            expandedKeywords: limitedKeywords
+        };
+    }
+
+    private expandQueryWithKG(question: string): { expandedKeywords: string[]; kgContext: KGContextResult } {
+        if (!kgLoaded || !kgGraph) {
+            return { expandedKeywords: [], kgContext: { contextText: '', matchedNodes: [], expandedKeywords: [] } };
+        }
+
+        const keywords = this.extractKeywords(question);
+        const matchedIds = this.matchKGEntities(keywords);
+
+        if (matchedIds.length === 0) {
+            return { expandedKeywords: [], kgContext: { contextText: '', matchedNodes: [], expandedKeywords: [] } };
+        }
+
+        const kgContext = this.generateKGContext(matchedIds);
+
+        const originalKwSet = new Set(keywords.map(k => k.toLowerCase()));
+        const extraKeywords = kgContext.expandedKeywords.filter(k => !originalKwSet.has(k.toLowerCase()));
+
+        return { expandedKeywords: extraKeywords, kgContext };
     }
 
     // 对话历史，初始带系统提示词
@@ -672,7 +1009,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
     }
 
     // 检索相关文档（混合检索：向量 + 关键词）
-    private async retrieveRelevantDocs(question: string): Promise<{
+    private async retrieveRelevantDocs(question: string, extraKeywords: string[] = []): Promise<{
         contextText: string;
         fileNames: string[];
         retrievalDetails: RetrievalResult[];
@@ -685,8 +1022,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             return { contextText: '', fileNames: [], retrievalDetails: [] };
         }
 
-        // 提取问题关键词（中文词组 + 英文单词）
         const keywords = this.extractKeywords(question);
+        const allKeywords = [...keywords, ...extraKeywords];
 
         // 计算问题向量
         const questionEmbedding = await this.generateEmbedding(question);
@@ -705,9 +1042,9 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
             vectorRankMap.set(item.chunk, index + 1);
         });
 
-        // 计算关键词检索排名（使用BM25算法）
+        // 计算关键词检索排名（使用BM25算法，含KG扩展词）
         const keywordCandidates = docChunks.map((chunk, index) => {
-            const score = this.calculateBM25Score(keywords, index);
+            const score = this.calculateBM25Score(allKeywords, index);
             return { chunk, score };
         }).filter(item => item.score >= BM25_MIN_SCORE);
 
@@ -730,7 +1067,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
             const rrfVector = rankVector !== Number.MAX_SAFE_INTEGER ? 1 / (RRF_K + rankVector) : 0;
             const rrfKeyword = rankKeyword !== Number.MAX_SAFE_INTEGER ? 1 / (RRF_K + rankKeyword) : 0;
-            const rrfScore = rrfVector + rrfKeyword;
+            const rrfScore = rrfVector * RRF_VECTOR_WEIGHT + rrfKeyword * RRF_KEYWORD_WEIGHT;
 
             return { chunk, rrfScore, rankVector, rankKeyword, rrfVector, rrfKeyword };
         });
@@ -779,9 +1116,10 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         const kwStr = keywords.length > 0 ? keywords.join(', ') : '(无)';
+        const extraKwStr = extraKeywords.length > 0 ? ` + KG扩展[${extraKeywords.join(', ')}]` : '';
         console.log(`[RAG] ─── 检索 ───`);
         console.log(`[RAG] Query: "${question}"`);
-        console.log(`[RAG] Keywords: [${kwStr}]`);
+        console.log(`[RAG] Keywords: [${kwStr}]${extraKwStr}`);
         console.log(`[RAG] 向量候选=${vectorCandidates.length} | BM25候选=${keywordCandidates.length} | 合并=${candidateChunks.size}`);
         console.log(`[RAG] RRF→Rerank: Top${RRF_TOP_K}→Top${RERANK_TOP_K} | 命中: ${fileNames.join(', ')}`);
 
@@ -1036,11 +1374,12 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            // 检索相关文档
-            const ragResult = await this.retrieveRelevantDocs(question);
+            const { expandedKeywords, kgContext } = this.expandQueryWithKG(question);
+
+            const ragResult = await this.retrieveRelevantDocs(question, expandedKeywords);
             const hasRagDocs = ragResult.fileNames.length > 0;
+            const hasKGContext = kgContext.contextText.length > 0;
             
-            // 构造存入历史的用户消息（不含RAG文档，避免历史膨胀）
             let historyContent = `用户问题：${question}`;
 
             if (hasContext && AiAssistantViewProvider.selectedCodeContext) {
@@ -1053,41 +1392,45 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
             this.conversationHistory.push({ role: 'user', content: historyContent });
 
-            // 构造发送给大模型的消息（在最后一条用户消息后注入RAG文档）
             const messagesForLLM = [...this.conversationHistory];
             const lastIdx = messagesForLLM.length - 1;
-            if (hasRagDocs) {
-                messagesForLLM[lastIdx] = {
-                    ...messagesForLLM[lastIdx],
-                    content: `${historyContent}\n\n${ragResult.contextText}`
-                };
+            let llmContent = historyContent;
+            if (hasKGContext) {
+                llmContent += `\n\n${kgContext.contextText}`;
             } else {
-                messagesForLLM[lastIdx] = {
-                    ...messagesForLLM[lastIdx],
-                    content: `${historyContent}\n\n参考文档：空`
-                };
+                llmContent += '\n\n知识图谱关联：空';
             }
+            if (hasRagDocs) {
+                llmContent += `\n\n${ragResult.contextText}`;
+            } else {
+                llmContent += '\n\n参考文档：空';
+            }
+            messagesForLLM[lastIdx] = {
+                ...messagesForLLM[lastIdx],
+                content: llmContent
+            };
 
             const rawAnswer = await this.callOllama(messagesForLLM);
 
-            // 先把大模型原始回答存入历史（不含手动拼接的来源说明，避免历史污染）
             this.conversationHistory.push({ role: 'assistant', content: rawAnswer });
 
-            // 拼接来源说明，仅用于前端展示，不进历史
             let finalAnswer = rawAnswer;
-            if (hasRagDocs) {
-                finalAnswer += `\n\n知识库中有相关文档：${ragResult.fileNames.join(", ")}`;
-            } else {
-                finalAnswer += `\n\n知识库中无相关文档`;
+            const sources: string[] = [];
+            if (hasKGContext) {
+                sources.push(`知识图谱(${kgContext.matchedNodes.length}个匹配节点)`);
             }
+            if (hasRagDocs) {
+                sources.push(`知识库文档: ${ragResult.fileNames.join(", ")}`);
+            }
+            finalAnswer += sources.length > 0 ? `\n\n📚 来源：${sources.join(' | ')}` : '\n\n📚 来源：无';
 
-            // 发送最终回答给前端（包含检索详情）
             if (AiAssistantViewProvider.currentPanel) {
                 AiAssistantViewProvider.currentPanel.webview.postMessage({
                     type: 'aiResponse',
                     response: finalAnswer,
                     hasContext: hasContext,
-                    retrievalDetails: ragResult.retrievalDetails || []
+                    retrievalDetails: ragResult.retrievalDetails || [],
+                    kgMatchedNodes: hasKGContext ? kgContext.matchedNodes : []
                 });
             }
 
@@ -1167,9 +1510,14 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
                 gccAvailable = false;
             }
 
+            const { kgContext } = this.expandQueryWithKG(code.substring(0, 500));
+
             let userContent = `请对以下代码进行全面语法检查：\n\n文件：${fileName}\n语言：${language}\n\n代码：\n\`\`\`c\n${code}\n\`\`\``;
             if (gccAvailable && gccOutput.trim()) {
                 userContent += `\n\nGCC编译器输出：\n\`\`\`\n${gccOutput}\n\`\`\``;
+            }
+            if (kgContext.contextText) {
+                userContent += `\n\n${kgContext.contextText}`;
             }
 
             const messages = [
@@ -1215,10 +1563,15 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         try {
             const historySummary = this.summarizeHistory();
-            const ragResult = await this.retrieveRelevantDocs('C语言学习路径 编程基础 知识点 教程');
+            const { expandedKeywords, kgContext } = this.expandQueryWithKG(userInput);
+            const ragResult = await this.retrieveRelevantDocs('C语言学习路径 编程基础 知识点 教程', expandedKeywords);
             const hasRagDocs = ragResult.fileNames.length > 0;
+            const hasKGContext = kgContext.contextText.length > 0;
 
             let userContent = `学生的学习需求：${userInput}\n\n学习记录：\n${historySummary}`;
+            if (hasKGContext) {
+                userContent += `\n\n${kgContext.contextText}`;
+            }
             if (hasRagDocs) {
                 userContent += `\n\n${ragResult.contextText}`;
             }
