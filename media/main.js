@@ -46,10 +46,6 @@
 
         src = escapeHtml(src);
 
-        for (let i = 0; i < tokens.length; i++) {
-            src = src.replace('\x00TOK' + i + '\x00', tokens[i]);
-        }
-
         src = src.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
         src = src.replace(/^### (.+)$/gm, '<h4>$1</h4>');
         src = src.replace(/^## (.+)$/gm, '<h3>$1</h3>');
@@ -75,10 +71,13 @@
         src = src.replace(/<p>\s*<\/p>/g, '');
         src = src.replace(/<p>\s*(<h[2-5]>)/g, '$1');
         src = src.replace(/(<\/h[2-5]>)\s*<\/p>/g, '$1');
-        src = src.replace(/<p>\s*(<div class="code-wrapper">)/g, '$1');
-        src = src.replace(/(<\/div>)\s*<\/p>/g, '$1');
         src = src.replace(/<p>\s*(<ul>)/g, '$1');
         src = src.replace(/(<\/ul>)\s*<\/p>/g, '$1');
+
+        for (let i = 0; i < tokens.length; i++) {
+            src = src.replace('<p>\x00TOK' + i + '\x00</p>', tokens[i]);
+            src = src.replace('\x00TOK' + i + '\x00', tokens[i]);
+        }
 
         return src;
     }
@@ -226,9 +225,7 @@
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'debug-doc-content';
-            const displayContent = doc.content.length > 200 ?
-                doc.content.substring(0, 200) + '...' : doc.content;
-            contentDiv.textContent = displayContent;
+            contentDiv.textContent = doc.content;
 
             docDiv.appendChild(headerDiv);
             docDiv.appendChild(contentDiv);
