@@ -16,7 +16,7 @@ const EMBED_MODEL = 'bge-m3';
 const RERANKER_MODEL = 'Xenova/bge-reranker-base';
 const CHUNK_SIZE = 800;
 const CHUNK_OVERLAP = 200;
-const CACHE_DIR_NAME = 'documents_xiangliang';
+const CACHE_DIR_NAME = 'resources/documents_xiangliang';
 const EMBEDDINGS_CACHE_FILE = 'embeddings.json';
 const RERANKER_CACHE_DIR = 'reranker_model';
 // 检索参数配置
@@ -452,7 +452,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            const kgPath = path.join(this._context.extensionPath, 'knowledge_graph.json');
+            const kgPath = path.join(this._context.extensionPath, 'resources', 'knowledge_graph.json');
             if (!fs.existsSync(kgPath)) {
                 console.log('[KG]知识图谱文件不存在--fail');
                 kgLoaded = true;
@@ -854,7 +854,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            const documentsPath = path.join(this._context.extensionPath, 'documents');
+            const documentsPath = path.join(this._context.extensionPath, 'resources', 'documents');
 
             if (!fs.existsSync(documentsPath)) {
                 console.log(`[RAG]文档目录不存在: ${documentsPath}--fail`);
@@ -1144,7 +1144,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider {
 
         this.stopWords = new Set<string>();
         try {
-            const stopWordsPath = path.join(this._context.extensionPath, 'stopwords.txt');
+            const stopWordsPath = path.join(this._context.extensionPath, 'resources', 'stopwords.txt');
             if (fs.existsSync(stopWordsPath)) {
                 const content = fs.readFileSync(stopWordsPath, 'utf-8');
                 const lines = content.split('\n');

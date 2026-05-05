@@ -1,6 +1,6 @@
-# The Book 
+# The Book
 
-# Chapter 1. Getting Started 
+# Chapter 1. Getting Started
 
 ### 1. What C Is and Why It Still Matters
 
@@ -978,7 +978,7 @@ Even small C utilities benefit from structure, you'll thank yourself later when 
 This small structure is the seed of every serious C project.
 Once you can organize your files this way, you're ready to grow into larger systems, libraries, tools, and applications that others can use and build upon.
 
-# Chapter 2. Language Basics 
+# Chapter 2. Language Basics
 
 ### 11. Data Types and Variables
 
@@ -2648,7 +2648,7 @@ You've now moved beyond syntax, you've built a working, reusable C program that 
 This calculator marks the end of your **Language Basics** journey, from variables and control flow to full, interactive programs.
 In the next chapter, you'll dive into memory: how C stores your data, manages it, and lets you control it directly.
 
-# Chapter 3. Working with Memory 
+# Chapter 3. Working with Memory
 
 ### 21. Understanding Memory Layout (Stack, Heap, Data, Code)
 
@@ -3171,7 +3171,7 @@ msg[2] = l (address: 0x7ffd29c4a0a2)
 
 Access via pointer arithmetic:
 *(ptr + 0) = C
-*(ptr + 1) =  
+*(ptr + 1) =
 *(ptr + 2) = l
 ...
 
@@ -4360,7 +4360,7 @@ You've now completed **Chapter 3: Working with Memory**.
 You understand how data lives, moves, and disappears in C, and you've practiced taking full control over it.
 From here, you'll learn how to **structure** that data elegantly using `struct`, `union`, and real-world data abstractions in Chapter 4.
 
-# Chapter 4. Structuring Data 
+# Chapter 4. Structuring Data
 
 ### 31. Structures and Nested Structures
 
@@ -5769,7 +5769,7 @@ int main(void) {
 Output:
 
 ```
-Queue: 1 2 3 
+Queue: 1 2 3
 Dequeued: 1
 Dequeued: 2
 Remaining: 3
@@ -6430,7 +6430,7 @@ From here, you can scale to databases, caches, or in-memory key-value stores, al
 You've completed **Chapter 4: Structuring Data**, the heart of understanding how C organizes the world.
 Next, you'll move from in-memory structures to **input, output, and files**, learning how to interact with the outside world through the standard I/O library in Chapter 5.
 
-# Chapter 5. Input, Output and Files 
+# Chapter 5. Input, Output and Files
 
 ### 41. Standard I/O and printf/scanf
 
@@ -8512,7 +8512,7 @@ This completes **Chapter 5: Input, Output, and Files**, a milestone in your jour
 You can now handle text, binary, streams, and persistent data with safety and clarity.
 Next, you'll step into **Chapter 6: Compilation and the Build Process**, where source code transforms into executable binaries through preprocessing, compilation, linking, and automation.
 
-# Chapter 6. Compilation and the build process 
+# Chapter 6. Compilation and the build process
 
 ### 51. From Source to Executable: The Compilation Pipeline
 
@@ -14318,7 +14318,7 @@ You've just built a simplified version of the core that powers **every Unix shel
 
 Next, we'll move into **Chapter 8: Debugging, Testing, and Profiling**, starting with **gdb**, your most powerful ally in understanding and fixing C programs.
 
-# Chapter 8. Debugging, Testing and Profiling 
+# Chapter 8. Debugging, Testing and Profiling
 
 ### 71. Debugging with gdb
 
@@ -16862,7 +16862,7 @@ C doesn't forgive mistakes, but it rewards precision.
 
 Next, we'll begin **Chapter 9: Portable and Modern C**, where you'll learn how to write C that runs everywhere, from embedded chips to modern servers.
 
-# Chapter 9. Portable and Modern C 
+# Chapter 9. Portable and Modern C
 
 ### 81. The C Standard Timeline (C89 to C23)
 
@@ -17060,9 +17060,9 @@ gcc -dM -E - < /dev/null | grep __STDC_VERSION__
 Common outputs:
 
 ```
-199901L  → C99  
-201112L  → C11  
-201710L  → C17  
+199901L  → C99
+201112L  → C11
+201710L  → C17
 202311L  → C23
 ```
 
@@ -21403,7 +21403,7 @@ Add a `LICENSE` file so others know how they can use your code. Common ones:
 Example MIT License header for your source files:
 
 ```c
-/* 
+/*
  * Copyright (c) 2025 Your Name
  * Licensed under the MIT License.
  */
