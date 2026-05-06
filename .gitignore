@@ -7,3 +7,8 @@ node_modules
 finetune/base_model/
 finetune/output/
 finetune/merged_model/
+reranker_model/
+
+*.doc
+*.docx
+resources/documents_xiangliang/
