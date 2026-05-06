@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+import argparse
 import torch
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -65,9 +66,11 @@ JUDGE_SYSTEM_PROMPT = """你是一位严格的C语言编程教学评估专家。
 {"correctness": X, "completeness": X, "helpfulness": X, "format": X, "comment": "简短评语"}"""
 
 
-def load_finetuned_model():
+def load_finetuned_model(base_model=DEFAULT_BASE_MODEL, lora_path=DEFAULT_LORA_PATH):
     print("Loading fine-tuned model...")
-    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_BASE_MODEL, trust_remote_code=True)
+    print(f"  Base model: {base_model}")
+    print(f"  LoRA path: {lora_path}")
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -77,13 +80,14 @@ def load_finetuned_model():
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        DEFAULT_BASE_MODEL,
+        base_model,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     )
-    model = PeftModel.from_pretrained(model, DEFAULT_LORA_PATH)
+    if lora_path and os.path.exists(lora_path):
+        model = PeftModel.from_pretrained(model, lora_path)
     model.eval()
     return model, tokenizer
 
@@ -161,10 +165,21 @@ def judge_with_glm(question, reference_answer, model_answer, code=None, docs=Non
 
 
 def main():
-    with open(DEFAULT_TEST_FILE, "r", encoding="utf-8") as f:
+    parser = argparse.ArgumentParser(description="LLM-as-a-Judge 评估微调模型")
+    parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL)
+    parser.add_argument("--lora_path", type=str, default=DEFAULT_LORA_PATH)
+    parser.add_argument("--test_file", type=str, default=DEFAULT_TEST_FILE)
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Max number of samples to evaluate")
+    args = parser.parse_args()
+
+    with open(args.test_file, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
-    model, tokenizer = load_finetuned_model()
+    if args.max_samples:
+        test_data = test_data[:args.max_samples]
+
+    model, tokenizer = load_finetuned_model(args.base_model, args.lora_path)
 
     results = []
     total_scores = {"correctness": 0, "completeness": 0, "helpfulness": 0, "format": 0}

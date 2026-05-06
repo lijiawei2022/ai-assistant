@@ -10,7 +10,6 @@ import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain
 import * as crypto from 'crypto';
 import Graph from 'graphology';
 
-// 配置（从VSCode Settings读取，提供默认值）
 const DEFAULT_LLM_BASE_URL = 'http://localhost:8000';
 const DEFAULT_EMBED_BASE_URL = 'http://localhost:11434';
 
@@ -171,8 +170,11 @@ function ollamaStreamRequest(
             for (const line of lines) {
                 if (cancelled || doneFired) return;
                 const trimmed = line.trim();
-                if (!trimmed || !trimmed.startsWith('data:')) continue;
-                const jsonStr = trimmed.slice(5).trim();
+                if (!trimmed) continue;
+                let jsonStr = trimmed;
+                if (trimmed.startsWith('data:')) {
+                    jsonStr = trimmed.slice(5).trim();
+                }
                 if (!jsonStr) continue;
                 try {
                     const parsed = JSON.parse(jsonStr);
@@ -423,7 +425,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
         console.log(`[RAG]初始化完成 [Model ${modelConnected ? 'OK' : '--'} | ${docChunks.length} chunks | Reranker ${rerankerReady ? 'OK' : '--'} | KG ${kgLoaded ? kgGraph?.order + '节点' : '--'}] ${elapsed}s`);
     }
 
-    // 检查大模型连接
     private async checkModelConnection(): Promise<boolean> {
         try {
             const llmBase = getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL);
@@ -471,12 +472,30 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
             const isOllama = llmBase.replace(/\/+$/, '') === embedBase.replace(/\/+$/, '');
             if (isOllama) {
                 try {
-                    const data = await ollamaRequest(getLlmUrl(), {
-                        model: getLlmModel(),
-                        messages: [{ role: 'user', content: 'hi' }],
-                        stream: false
-                    }, 15000);
-                    return !!data.message?.content;
+                    const tagsUrl = `${llmBase.replace(/\/+$/, '')}/api/tags`;
+                    const tagsParsed = new URL(tagsUrl);
+                    const tagsIsHttps = tagsParsed.protocol === 'https:';
+                    const tagsReqFn = tagsIsHttps ? https.request : http.request;
+                    return await new Promise<boolean>((resolve) => {
+                        const opts: http.RequestOptions = {
+                            hostname: tagsParsed.hostname,
+                            port: tagsParsed.port,
+                            path: tagsParsed.pathname,
+                            method: 'GET',
+                            timeout: 5000
+                        };
+                        if (tagsIsHttps) { (opts as any).rejectUnauthorized = false; }
+                        const req = tagsReqFn(opts, (res) => {
+                            let d = '';
+                            res.on('data', (c: string) => { d += c; });
+                            res.on('end', () => {
+                                try { resolve(!!JSON.parse(d).models); } catch { resolve(false); }
+                            });
+                        });
+                        req.on('error', () => resolve(false));
+                        req.on('timeout', () => { req.destroy(); resolve(false); });
+                        req.end();
+                    });
                 } catch {
                     return false;
                 }

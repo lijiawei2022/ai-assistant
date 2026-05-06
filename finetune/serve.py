@@ -266,6 +266,8 @@ def load_model(model_path: str, lora_path: Optional[str] = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL,
+                        help="Path to base or merged model directory")
     parser.add_argument("--lora", type=str, default=None,
                         help="Path to LoRA weights (e.g. output/final)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -275,11 +277,11 @@ if __name__ == "__main__":
                         help="Number of concurrent inference threads (default: 1)")
     args = parser.parse_args()
 
-    model_path = DEFAULT_BASE_MODEL
-    model_desc = "Base model"
+    model_path = args.base_model
+    model_desc = os.path.basename(model_path)
 
     if args.lora:
-        model_desc = f"Base model + LoRA ({args.lora})"
+        model_desc = f"{os.path.basename(model_path)} + LoRA ({args.lora})"
 
     if not os.path.exists(model_path):
         print(f"ERROR: Model not found at: {model_path}")
