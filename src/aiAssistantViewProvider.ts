@@ -59,7 +59,7 @@ const KG_MAX_CONTEXT_CHARS = 800;  // KG上下文最大字符数
 
 const RERANK_SCORE_WEIGHT = 0.8;   // Rerank分数在最终融合中的权重
 const RRF_SCORE_WEIGHT = 0.2;      // RRF分数在最终融合中的权重
-const LLM_TIMEOUT = 120000;        // LLM调用超时时间(ms)
+const LLM_TIMEOUT = 180000;        // LLM调用超时时间(ms)
 
 function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -76,32 +76,146 @@ function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<an
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(bodyStr)
-            },
-            timeout: timeoutMs
+            }
         };
 
         if (isHttps) {
             (options as any).rejectUnauthorized = false;
         }
 
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (!settled) {
+                settled = true;
+                req.destroy();
+                reject(new Error('Request timeout'));
+            }
+        }, timeoutMs);
+
         const req = requestFn(options, (res) => {
             let data = '';
             res.on('data', (chunk: string) => { data += chunk; });
             res.on('end', () => {
-                try {
-                    resolve(JSON.parse(data));
-                } catch {
-                    reject(new Error(`Invalid JSON response: ${data.substring(0, 200)}`));
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    try {
+                        resolve(JSON.parse(data));
+                    } catch {
+                        reject(new Error(`Invalid JSON response: ${data.substring(0, 200)}`));
+                    }
                 }
             });
         });
 
-        req.on('error', (err: Error) => reject(err));
-        req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+        req.on('error', (err: Error) => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            }
+        });
 
         req.write(bodyStr);
         req.end();
     });
+}
+
+function ollamaStreamRequest(
+    url: string,
+    body: object,
+    onToken: (token: string) => void,
+    onDone: () => void,
+    onError: (err: Error) => void,
+    timeoutMs: number
+): { cancel: () => void } {
+    const bodyStr = JSON.stringify({ ...body, stream: true });
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === 'https:';
+    const requestFn = isHttps ? https.request : http.request;
+
+    let cancelled = false;
+    let doneFired = false;
+
+    const options: http.RequestOptions = {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(bodyStr)
+        }
+    };
+
+    if (isHttps) {
+        (options as any).rejectUnauthorized = false;
+    }
+
+    const timer = setTimeout(() => {
+        if (!cancelled && !doneFired) {
+            cancelled = true;
+            req.destroy();
+            onError(new Error('Request timeout'));
+        }
+    }, timeoutMs);
+
+    const req = requestFn(options, (res) => {
+        let buffer = '';
+        res.on('data', (chunk: Buffer) => {
+            if (cancelled || doneFired) return;
+            clearTimeout(timer);
+            buffer += chunk.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (cancelled || doneFired) return;
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith('data:')) continue;
+                const jsonStr = trimmed.slice(5).trim();
+                if (!jsonStr) continue;
+                try {
+                    const parsed = JSON.parse(jsonStr);
+                    if (parsed.done) {
+                        doneFired = true;
+                        onDone();
+                        return;
+                    }
+                    const content = parsed.message?.content;
+                    if (content) {
+                        onToken(content);
+                    }
+                } catch {
+                }
+            }
+        });
+        res.on('end', () => {
+            if (!cancelled && !doneFired) {
+                clearTimeout(timer);
+                doneFired = true;
+                onDone();
+            }
+        });
+    });
+
+    req.on('error', (err: Error) => {
+        if (!cancelled) {
+            cancelled = true;
+            clearTimeout(timer);
+            onError(err);
+        }
+    });
+
+    req.write(bodyStr);
+    req.end();
+
+    return {
+        cancel: () => {
+            cancelled = true;
+            clearTimeout(timer);
+            req.destroy();
+        }
+    };
 }
 
 // 系统设计提示词：面向程序设计领域的AI助教
@@ -312,12 +426,63 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
     // 检查大模型连接
     private async checkModelConnection(): Promise<boolean> {
         try {
-            const data = await ollamaRequest(getLlmUrl(), {
-                model: getLlmModel(),
-                messages: [{ role: 'user', content: 'hi' }],
-                stream: false
-            }, 10000);
-            return !!data.message?.content;
+            const llmBase = getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL);
+            const healthUrl = `${llmBase.replace(/\/+$/, '')}/health`;
+            const parsed = new URL(healthUrl);
+            const isHttps = parsed.protocol === 'https:';
+            const requestFn = isHttps ? https.request : http.request;
+
+            const result = await new Promise<boolean>((resolve, reject) => {
+                const options: http.RequestOptions = {
+                    hostname: parsed.hostname,
+                    port: parsed.port,
+                    path: parsed.pathname,
+                    method: 'GET',
+                    timeout: 5000
+                };
+
+                if (isHttps) {
+                    (options as any).rejectUnauthorized = false;
+                }
+
+                const req = requestFn(options, (res) => {
+                    let data = '';
+                    res.on('data', (chunk: string) => { data += chunk; });
+                    res.on('end', () => {
+                        try {
+                            const json = JSON.parse(data);
+                            resolve(json.status === 'ok' && json.model_loaded === true);
+                        } catch {
+                            resolve(false);
+                        }
+                    });
+                });
+
+                req.on('error', () => resolve(false));
+                req.on('timeout', () => { req.destroy(); resolve(false); });
+                req.end();
+            });
+
+            if (result) {
+                return true;
+            }
+
+            const embedBase = getConfig<string>('embeddingBaseUrl', DEFAULT_EMBED_BASE_URL);
+            const isOllama = llmBase.replace(/\/+$/, '') === embedBase.replace(/\/+$/, '');
+            if (isOllama) {
+                try {
+                    const data = await ollamaRequest(getLlmUrl(), {
+                        model: getLlmModel(),
+                        messages: [{ role: 'user', content: 'hi' }],
+                        stream: false
+                    }, 15000);
+                    return !!data.message?.content;
+                } catch {
+                    return false;
+                }
+            }
+
+            return false;
         } catch {
             return false;
         }
@@ -948,7 +1113,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
 
     // 调用 Ollama 多轮对话接口（自动注入系统提示到最前）
     private async callOllama(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
-        // 移除历史中可能存在的旧系统消息，插入最新的系统提示到最前
         const messagesWithoutSystem = messages.filter(m => m.role !== 'system');
         const finalMessages = [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messagesWithoutSystem];
 
@@ -963,12 +1127,26 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
         console.log('[LLM] ═══════════════════════════════');
 
         try {
-            const data = await ollamaRequest(getLlmUrl(), {
-                model: getLlmModel(),
-                messages: finalMessages,
-                stream: false
-            }, LLM_TIMEOUT);
-            return data.message?.content || '未收到有效响应';
+            const fullText = await new Promise<string>((resolve, reject) => {
+                let accumulated = '';
+                const streamHandle = ollamaStreamRequest(
+                    getLlmUrl(),
+                    { model: getLlmModel(), messages: finalMessages },
+                    (token) => {
+                        accumulated += token;
+                        if (AiAssistantViewProvider.currentPanel) {
+                            AiAssistantViewProvider.currentPanel.webview.postMessage({
+                                type: 'streamToken',
+                                token: token
+                            });
+                        }
+                    },
+                    () => resolve(accumulated),
+                    (err) => reject(err),
+                    LLM_TIMEOUT
+                );
+            });
+            return fullText || '未收到有效响应';
         } catch (e) {
             return '调用大模型失败: ' + (e as Error).message;
         }

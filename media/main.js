@@ -386,11 +386,59 @@
         });
     }
 
+    let streamingMessageDiv = null;
+    let streamingContentEl = null;
+    let streamingText = '';
+
     window.addEventListener('message', (event) => {
         const message = event.data;
         switch (message.type) {
+            case 'streamToken':
+                if (!streamingMessageDiv) {
+                    streamingMessageDiv = document.createElement('div');
+                    streamingMessageDiv.className = 'message ai-message streaming';
+
+                    const avatar = document.createElement('div');
+                    avatar.className = 'message-avatar ai-avatar';
+                    avatar.textContent = 'AI';
+
+                    const body = document.createElement('div');
+                    body.className = 'message-body';
+
+                    streamingContentEl = document.createElement('div');
+                    streamingContentEl.className = 'message-content markdown-body';
+                    streamingText = '';
+
+                    body.appendChild(streamingContentEl);
+                    streamingMessageDiv.appendChild(avatar);
+                    streamingMessageDiv.appendChild(body);
+                    chatMessages.appendChild(streamingMessageDiv);
+                }
+                streamingText += message.token;
+                streamingContentEl.innerHTML = renderMarkdown(streamingText);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                break;
             case 'aiResponse':
-                addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType, message.llmMessages, message.kgMatchedNodes);
+                if (streamingMessageDiv) {
+                    streamingMessageDiv.classList.remove('streaming');
+                    streamingContentEl.innerHTML = renderMarkdown(message.response);
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+                    if (message.kgMatchedNodes && message.kgMatchedNodes.length > 0) {
+                        const kgPanel = createKGPanel(message.kgMatchedNodes);
+                        streamingMessageDiv.querySelector('.message-body').appendChild(kgPanel);
+                    }
+                    if (message.retrievalDetails && message.retrievalDetails.length > 0) {
+                        const debugPanel = createDebugPanel(message.retrievalDetails);
+                        streamingMessageDiv.querySelector('.message-body').appendChild(debugPanel);
+                    }
+
+                    streamingMessageDiv = null;
+                    streamingContentEl = null;
+                    streamingText = '';
+                } else {
+                    addMessage(message.response, false, message.isError, message.retrievalDetails, message.featureType, message.llmMessages, message.kgMatchedNodes);
+                }
                 statusElement.textContent = 'Response received';
                 break;
             case 'selectedCode':

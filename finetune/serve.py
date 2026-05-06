@@ -24,10 +24,12 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import uvicorn
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
 from peft import PeftModel
+from threading import Thread
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE_MODEL = os.path.join(SCRIPT_DIR, "base_model")
@@ -77,9 +79,10 @@ def _generate(messages_dict: list, gen_kwargs: dict) -> str:
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
+            use_cache=True,
             **gen_kwargs,
         )
 
@@ -88,6 +91,44 @@ def _generate(messages_dict: list, gen_kwargs: dict) -> str:
         skip_special_tokens=True,
     )
     return response_text
+
+
+def _generate_stream(messages_dict: list, gen_kwargs: dict):
+    global model, tokenizer
+
+    text = tokenizer.apply_chat_template(
+        messages_dict,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
+
+    gen_kwargs_copy = {**gen_kwargs, "streamer": streamer}
+
+    thread = Thread(target=model.generate, kwargs={**inputs, **gen_kwargs_copy})
+    thread.start()
+
+    for new_text in streamer:
+        if new_text:
+            yield new_text
+
+    thread.join()
+
+
+def _make_sse_chunk(model_name: str, content: str, done: bool = False) -> str:
+    chunk = {
+        "model": model_name,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "message": {"role": "assistant", "content": content},
+        "done": done,
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
 @app.post("/api/chat")
@@ -101,10 +142,10 @@ async def chat(request: ChatRequest):
 
     gen_kwargs = {
         "max_new_tokens": 1024,
-        "temperature": 0.7,
+        "temperature": 0.6,
         "top_p": 0.9,
         "do_sample": True,
-        "repetition_penalty": 1.1,
+        "repetition_penalty": 1.05,
     }
 
     if request.options:
@@ -115,20 +156,43 @@ async def chat(request: ChatRequest):
         if "num_predict" in request.options:
             gen_kwargs["max_new_tokens"] = request.options["num_predict"]
 
-    if executor is not None:
-        loop = asyncio.get_running_loop()
-        response_text = await loop.run_in_executor(
-            executor, _generate, messages_dict, gen_kwargs
+    model_name = request.model or "huggingface-serve"
+
+    if request.stream:
+        async def stream_response():
+            loop = asyncio.get_running_loop()
+            streamer = _generate_stream(messages_dict, gen_kwargs)
+            for text_chunk in streamer:
+                sse = _make_sse_chunk(model_name, text_chunk, done=False)
+                yield sse
+                await asyncio.sleep(0)
+            final = _make_sse_chunk(model_name, "", done=True)
+            yield final
+
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
     else:
-        response_text = _generate(messages_dict, gen_kwargs)
+        if executor is not None:
+            loop = asyncio.get_running_loop()
+            response_text = await loop.run_in_executor(
+                executor, _generate, messages_dict, gen_kwargs
+            )
+        else:
+            response_text = _generate(messages_dict, gen_kwargs)
 
-    return ChatResponse(
-        model=request.model or "huggingface-serve",
-        created_at=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-        message=ChatMessage(role="assistant", content=response_text),
-        done=True,
-    )
+        return ChatResponse(
+            model=model_name,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            message=ChatMessage(role="assistant", content=response_text),
+            done=True,
+        )
 
 
 @app.get("/api/tags")
@@ -172,12 +236,21 @@ def load_model(model_path: str, lora_path: Optional[str] = None):
         bnb_4bit_use_double_quant=True,
     )
 
+    try:
+        import flash_attn
+        attn_implementation = "flash_attention_2"
+        print("Flash Attention 2 detected, enabling...")
+    except ImportError:
+        attn_implementation = None
+        print("Flash Attention 2 not available, using default attention")
+
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
+        attn_implementation=attn_implementation,
     )
     model.eval()
 
@@ -224,6 +297,7 @@ if __name__ == "__main__":
     print(f"  Port:     {args.port}")
     print(f"  Workers:  {args.workers}")
     print(f"  Endpoint: http://{args.host}:{args.port}/api/chat")
+    print(f"  Streaming: Supported (stream=true)")
     print("=" * 60)
 
     load_model(model_path, args.lora)
