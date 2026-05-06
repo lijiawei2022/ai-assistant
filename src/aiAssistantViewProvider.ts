@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
+import * as https from 'https';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -64,6 +65,8 @@ function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<an
     return new Promise((resolve, reject) => {
         const bodyStr = JSON.stringify(body);
         const parsed = new URL(url);
+        const isHttps = parsed.protocol === 'https:';
+        const requestFn = isHttps ? https.request : http.request;
 
         const options: http.RequestOptions = {
             hostname: parsed.hostname,
@@ -77,7 +80,11 @@ function ollamaRequest(url: string, body: object, timeoutMs: number): Promise<an
             timeout: timeoutMs
         };
 
-        const req = http.request(options, (res) => {
+        if (isHttps) {
+            (options as any).rejectUnauthorized = false;
+        }
+
+        const req = requestFn(options, (res) => {
             let data = '';
             res.on('data', (chunk: string) => { data += chunk; });
             res.on('end', () => {
@@ -255,7 +262,6 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
     private static _instance: AiAssistantViewProvider | undefined;
     private readonly _extensionUri: vscode.Uri;
     private readonly _context: vscode.ExtensionContext;
-    private _disposed = false;
     
     constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this._extensionUri = extensionUri;
@@ -268,10 +274,8 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
         if (AiAssistantViewProvider._instance === this) {
             AiAssistantViewProvider._instance = undefined;
         }
-        this._disposed = true;
     }
 
-    // 初始化：加载文档向量 + 自动启动模型服务 + 加载reranker
     private async initialize(): Promise<void> {
         const startTime = Date.now();
         console.log('[RAG]初始化开始');
@@ -353,7 +357,7 @@ export class AiAssistantViewProvider implements vscode.WebviewViewProvider, vsco
 
         try {
             const llmPort = new URL(getConfig<string>('llmBaseUrl', DEFAULT_LLM_BASE_URL)).port || '8000';
-            const args = [serveScript, '--port', llmPort, '--base_only'];
+            const args = [serveScript, '--port', llmPort];
 
             modelServerProcess = spawn(pythonCmd, args, {
                 cwd: path.join(this._context.extensionPath, 'finetune'),

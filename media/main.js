@@ -415,6 +415,14 @@
                     learningPathBtn.click();
                 }
                 break;
+            case 'initComplete':
+                if (message.modelConnected) {
+                    statusElement.textContent = '就绪 · 模型已连接';
+                } else {
+                    statusElement.textContent = '未连接 · 模型服务未启动';
+                    statusElement.style.color = 'var(--vscode-errorForeground, #f48771)';
+                }
+                break;
         }
     });
 
