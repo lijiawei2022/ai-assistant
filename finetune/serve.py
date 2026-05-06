@@ -3,9 +3,8 @@ HuggingFace 模型推理服务
 兼容 Ollama /api/chat 接口格式，供 VSCode 插件直接调用
 
 用法:
-  python serve.py                              # 使用合并后的微调模型（默认）
-  python serve.py --base_only                  # 仅使用原始基础模型
-  python serve.py --lora output/final          # 动态加载LoRA（不推荐，较慢）
+  python serve.py                              # 使用基础模型（默认）
+  python serve.py --lora output/final          # 动态加载LoRA
   python serve.py --port 8000                  # 指定端口
   python serve.py --host 0.0.0.0               # 指定监听地址（默认0.0.0.0，允许远程访问）
   python serve.py --workers 2                  # 并发推理线程数（默认1，受GPU显存限制）
@@ -31,7 +30,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MERGED_MODEL = os.path.join(SCRIPT_DIR, "merged_model")
 DEFAULT_BASE_MODEL = os.path.join(SCRIPT_DIR, "base_model")
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "0.0.0.0"
@@ -195,8 +193,6 @@ def load_model(model_path: str, lora_path: Optional[str] = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_only", action="store_true",
-                        help="Use base model only (no fine-tuning)")
     parser.add_argument("--lora", type=str, default=None,
                         help="Path to LoRA weights (e.g. output/final)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -206,18 +202,11 @@ if __name__ == "__main__":
                         help="Number of concurrent inference threads (default: 1)")
     args = parser.parse_args()
 
-    if args.base_only:
-        model_path = DEFAULT_BASE_MODEL
-        model_desc = "Base model (no fine-tuning)"
-    elif args.lora:
-        model_path = DEFAULT_BASE_MODEL
+    model_path = DEFAULT_BASE_MODEL
+    model_desc = "Base model"
+
+    if args.lora:
         model_desc = f"Base model + LoRA ({args.lora})"
-    elif os.path.exists(DEFAULT_MERGED_MODEL):
-        model_path = DEFAULT_MERGED_MODEL
-        model_desc = "Merged fine-tuned model"
-    else:
-        model_path = DEFAULT_BASE_MODEL
-        model_desc = "Base model (merged model not found)"
 
     if not os.path.exists(model_path):
         print(f"ERROR: Model not found at: {model_path}")

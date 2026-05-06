@@ -1,713 +1,110 @@
 import json
+SYSTEM_PROMPT = '你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。熟悉C语言等主流编程语言，精通数据结构、算法、软件工程等核心知识。\n\n## 输入格式\n每条用户消息固定包含以下四部分（某部分为"空"表示未提供）：\n- 用户问题：用户的核心诉求\n- 用户提供的代码：用户选中的代码片段\n- 知识图谱关联：从知识图谱检索的结构化关联信息（知识点层级、错误-原因-解决方案的因果链）\n- 参考文档：从知识库检索的相关文档片段\n\n## 回答要求\n1. 优先依据知识图谱关联理解问题的上下文关系，再结合参考文档获取详细内容\n2. 知识图谱关联不为空时，按图谱中的因果链和解决方案链组织回答结构\n3. 参考文档不为空时，用文档内容充实回答的细节\n4. 用户提供的代码不为空时，结合代码实际情况分析问题，将文档知识与代码对应\n5. 简洁精准，直接回答核心问题\n6. 必要时提供完整可运行的代码示例（用代码块包裹）\n7. 使用简洁中文，专业术语保留英文原文'
 
-SYSTEM_PROMPT = "你是程序设计领域的AI助教，专注于帮助学生掌握编程知识和技能。熟悉C语言等主流编程语言，精通数据结构、算法、软件工程等核心知识。\n\n## 输入格式\n每条用户消息固定包含以下三部分（某部分为\"空\"表示未提供）：\n- 用户问题：用户的核心诉求\n- 用户提供的代码：用户选中的代码片段\n- 参考文档：从知识库检索的相关文档\n\n## 回答要求\n1. 优先依据参考文档作答，文档不足或不相关时基于专业知识回答\n2. 代码不为空时，结合代码实际情况分析问题，将文档知识与代码对应\n3. 简洁精准，直接回答核心问题\n4. 必要时提供完整可运行的代码示例（用代码块包裹）\n5. 使用简洁中文，专业术语保留英文原文"
-
-def make_entry(question, code, docs, answer):
-    user_content = f"用户问题：{question}"
-    user_content += f"\n\n用户提供的代码：\n{code}" if code else "\n\n用户提供的代码：空"
-    user_content += f"\n\n参考文档：\n{docs}" if docs else "\n\n参考文档：空"
-    return {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": answer}
-        ]
-    }
-
+def make_entry(question, code, kg_context, docs, answer):
+    user_content = f'用户问题：{question}'
+    user_content += f'\n\n用户提供的代码：\n{code}' if code else '\n\n用户提供的代码：空'
+    user_content += f'\n\n知识图谱关联：\n{kg_context}' if kg_context else '\n\n知识图谱关联：空'
+    user_content += f'\n\n参考文档：\n{docs}' if docs else '\n\n参考文档：空'
+    return {'messages': [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': user_content}, {'role': 'assistant', 'content': answer}]}
 data = []
-
-# ========== 常见代码错误及解决方法 ==========
-
-data.append(make_entry(
-    "我的程序运行时出现了段错误（Segmentation Fault），请帮我分析原因",
-    "void swap(int *a, int *b) {\n    int *temp;\n    *temp = *a;\n    *a = *b;\n    *b = *temp;\n}\n\nint main(void) {\n    int x = 3, y = 5;\n    swap(&x, &y);\n    printf(\"x=%d, y=%d\\n\", x, y);\n    return 0;\n}",
-    None,
-    "问题出在 `swap` 函数中的 `int *temp;`。你声明了一个指针但没有让它指向任何有效内存——它是**未初始化的野指针**。`*temp = *a;` 试图向未知地址写入数据，触发段错误。\n\n**修复：** 将 `temp` 改为普通整型变量：\n```c\nvoid swap(int *a, int *b) {\n    int temp;\n    temp = *a;\n    *a = *b;\n    *b = temp;\n}\n```\n\n**要点：**\n1. 指针必须指向有效内存后才能解引用（`*ptr`），未初始化指针是C语言最常见的崩溃来源\n2. 这里只需临时保存一个整数值，普通 `int temp` 就够了\n3. 调试段错误的思路：检查所有指针操作——是否初始化？是否指向已释放内存？是否越界？"
-))
-
-data.append(make_entry(
-    "这段代码运行结果不稳定，有时正确有时崩溃",
-    "char *get_greeting(void) {\n    char msg[64];\n    strcpy(msg, \"Hello, World!\");\n    return msg;\n}",
-    None,
-    "这是经典的**返回局部变量地址**错误。`msg` 是栈上的局部数组，函数返回后栈帧被回收，返回的指针变成**悬垂指针**，访问它是未定义行为。\n\n**推荐修复：调用者提供缓冲区**\n```c\nvoid get_greeting(char *buf, size_t size) {\n    snprintf(buf, size, \"Hello, World!\");\n}\n\nint main(void) {\n    char greeting[64];\n    get_greeting(greeting, sizeof(greeting));\n    printf(\"%s\\n\", greeting);\n    return 0;\n}\n```\n内存的分配和释放在同一层，权责清晰。\n\n**核心原则：** 谁分配谁释放。"
-))
-
-data.append(make_entry(
-    "我的程序长时间运行后内存占用越来越大，怀疑有内存泄漏",
-    "void remove_first(struct Node *head) {\n    if (head->next == NULL) return;\n    struct Node *to_remove = head->next;\n    head->next = to_remove->next;\n}",
-    None,
-    "问题在 `remove_first` 中：你把节点从链表摘除了，但**没有 `free()` 释放内存**。每次删除都泄漏 `sizeof(struct Node)` 字节。\n\n**修复：**\n```c\nvoid remove_first(struct Node *head) {\n    if (head->next == NULL) return;\n    struct Node *to_remove = head->next;\n    head->next = to_remove->next;\n    free(to_remove);\n}\n```\n\n**排查工具：**\n- Valgrind：`valgrind --leak-check=full ./program`\n- AddressSanitizer：`gcc -fsanitize=address -g program.c`\n\n**防泄漏习惯：** 每写一个 `malloc`，立刻写配对的 `free`，再填充中间逻辑。"
-))
-
-data.append(make_entry(
-    "编译警告 implicit declaration of function 'strlen'，运行结果也不对",
-    "#include <stdio.h>\n\nint main(void) {\n    char name[] = \"Hello\";\n    int len = strlen(name);\n    printf(\"Length: %d\\n\", len);\n    return 0;\n}",
-    None,
-    "缺少头文件 `#include <string.h>`。`strlen` 的声明在 `<string.h>` 中，没有它编译器假设返回 `int`，但实际返回 `size_t`，64位系统上截断后结果错误。\n\n**修复：**\n```c\n#include <stdio.h>\n#include <string.h>\n\nint main(void) {\n    char name[] = \"Hello\";\n    size_t len = strlen(name);\n    printf(\"Length: %zu\\n\", len);\n    return 0;\n}\n```\n\n**要点：** 不要忽略编译器警告，建议加 `-Wall -Wextra`。用 `size_t` 接收 `strlen` 返回值，用 `%zu` 打印。"
-))
-
-data.append(make_entry(
-    "我的if判断总是走错分支",
-    "int a = 3;\nif (a = 5) {\n    printf(\"a is 5\\n\");\n} else {\n    printf(\"a is not 5\\n\");\n}",
-    None,
-    "把 `==`（比较）写成了 `=`（赋值）。`a = 5` 是赋值，表达式值为5（非零即真），条件永远为真。\n\n**修复：** `if (a == 5)`\n\n**防止方法：**\n1. 常量放左边：`if (5 == a)`，少写 `=` 会编译报错\n2. 开启 `-Wall` 警告"
-))
-
-data.append(make_entry(
-    "strcpy运行时崩溃了",
-    "char *src = \"Hello, World!\";\nchar *dst;\nstrcpy(dst, src);",
-    None,
-    "`dst` 是未初始化的指针，没有指向有效内存。`strcpy` 向未知地址写入，崩溃。\n\n**修复：**\n```c\nchar src[] = \"Hello, World!\";\nchar dst[64];\nstrcpy(dst, src);\n```\n\n或动态分配：\n```c\nchar *dst = malloc(strlen(src) + 1);\nif (dst) { strcpy(dst, src); free(dst); }\n```\n\n**核心原则：** 字符串操作前必须确保目标有足够内存。"
-))
-
-data.append(make_entry(
-    "函数调用后指针没有变化，为什么？",
-    "void alloc_buffer(char *ptr, int size) {\n    ptr = malloc(size);\n}\n\nint main(void) {\n    char *buf = NULL;\n    alloc_buffer(buf, 1024);\n    // buf 仍然是 NULL\n}",
-    None,
-    "C语言函数参数是**值传递**。`ptr` 是 `buf` 的拷贝，`ptr = malloc(size)` 只修改了拷贝，对原始 `buf` 无影响。\n\n**修复：传递指针的指针**\n```c\nvoid alloc_buffer(char **ptr, int size) {\n    *ptr = malloc(size);\n}\n\nint main(void) {\n    char *buf = NULL;\n    alloc_buffer(&buf, 1024);\n    if (buf) { free(buf); }\n}\n```\n\n**理解要点：** 要在函数内修改外部变量，必须传其地址。修改 `int` → 传 `int *`；修改 `char *` → 传 `char **`。"
-))
-
-data.append(make_entry(
-    "5/9为什么等于0？",
-    "int a = 5, b = 9;\ndouble result = a / b;\n// result 是 0.0，不是 0.555...",
-    None,
-    "C语言整数除法规则：**两个整数相除，结果还是整数，小数部分截断**。5/9 = 0，再赋给 `double` 变成 0.0。\n\n**修复：在除法前转换至少一个操作数**\n```c\ndouble result = (double)a / b;  // 5.0 / 9 = 0.555...\n```\n\n**注意：** `(double)(a / b)` 不行——先整数除法得0，再转double还是0.0。必须在除法**之前**转换。"
-))
-
-data.append(make_entry(
-    "链接时报错 undefined reference to 'sqrt'，但我已经包含了math.h",
-    "#include <stdio.h>\n#include <math.h>\nint main(void) {\n    printf(\"sqrt(2) = %f\\n\", sqrt(2.0));\n    return 0;\n}",
-    None,
-    "`#include <math.h>` 只提供了声明，`sqrt` 的实现在数学库 `libm` 中，GCC默认不链接。\n\n**修复：编译时加 `-lm`**\n```bash\ngcc program.c -o program -lm\n```\n\n**注意：** `-lm` 要放在源文件后面，因为链接器从左到右处理。常见需手动链接的库：`-lm`（数学）、`-lpthread`（线程）、`-lrt`（实时）。"
-))
-
-data.append(make_entry(
-    "我的二分查找总是返回-1",
-    "int binary_search(int arr[], int n, int target) {\n    int left = 0, right = n;\n    while (left < right) {\n        int mid = (left + right) / 2;\n        if (arr[mid] == target) return mid;\n        else if (arr[mid] < target) left = mid;\n        else right = mid;\n    }\n    return -1;\n}",
-    None,
-    "有两个bug：\n1. **区间定义不一致**：`right = n` 是右开区间，但 `left = mid` 按闭区间逻辑写\n2. **死循环**：当 `left + 1 == right` 时，`mid = left`，`left = mid` 不变\n\n**修复：统一左闭右开区间**\n```c\nint binary_search(int arr[], int n, int target) {\n    int left = 0, right = n;\n    while (left < right) {\n        int mid = left + (right - left) / 2;\n        if (arr[mid] == target) return mid;\n        else if (arr[mid] < target) left = mid + 1;\n        else right = mid;\n    }\n    return -1;\n}\n```\n\n**调试方法：** 在循环内加 `printf(\"left=%d, right=%d, mid=%d\\n\", left, right, mid);` 观察变量变化。"
-))
-
-data.append(make_entry(
-    "程序输出了很大的负数或4294967295这种奇怪数字",
-    None,
-    None,
-    "常见原因：\n1. **整数溢出**：`int a = 2000000000; int b = a + a;` → 负数。修复：用 `long long`\n2. **无符号下溢**：`unsigned int x = 5; unsigned int z = x - 10;` → 4294967291\n3. **格式符不匹配**：`long n; printf(\"%d\", n);` → 64位系统只打印低32位\n4. **未初始化变量**：`int x; printf(\"%d\", x);` → 栈上随机垃圾值\n5. **数组越界读取**：读到栈上其他数据\n\n**快速诊断：** 大负数→int溢出；4294967295→unsigned下溢；随机大数→未初始化或越界"
-))
-
-data.append(make_entry(
-    "sizeof(arr)在函数内外结果不同，为什么？",
-    "int arr[10];\nprintf(\"%zu\\n\", sizeof(arr));   // 40\n\nvoid foo(int arr[]) {\n    printf(\"%zu\\n\", sizeof(arr));  // 8\n}",
-    None,
-    "数组在大多数表达式中会**退化为指向首元素的指针**，但 `sizeof` 是例外——在定义处返回整个数组大小。\n\n函数参数 `int arr[]` 只是 `int *arr` 的语法糖，传参时退化，所以 `sizeof(arr)` 是指针大小（64位系统8字节）。\n\n**影响：** 函数内不能用 `sizeof(arr)/sizeof(arr[0])` 计算元素个数，必须额外传入长度。\n\n**三个不退化的例外：** `sizeof(arr)`、`&arr`、字符串初始化 `char s[] = \"hello\"`"
-))
-
-data.append(make_entry(
-    "我的scanf读取字符串后，下一个输入被跳过了",
-    "int age;\nchar name[32];\nscanf(\"%d\", &age);\nscanf(\"%s\", name);",
-    None,
-    "`scanf(\"%d\")` 读取数字后，换行符 `\\n` 留在缓冲区，下一个 `scanf(\"%s\")` 可能读到残留字符。\n\n**修复1：格式字符串加空格**\n```c\nscanf(\"%d\", &age);\nscanf(\" %31s\", name);  // %前加空格跳过空白\n```\n\n**修复2（推荐）：用fgets+sscanf**\n```c\nchar line[256];\nfgets(line, sizeof(line), stdin);\nsscanf(line, \"%d\", &age);\nfgets(line, sizeof(line), stdin);\nline[strcspn(line, \"\\n\")] = '\\0';\n```\n\n**scanf安全清单：** 字符串指定宽度 `%31s`；`%d` 前加空格；检查返回值；混合输入优先用 `fgets`+`sscanf`；永远不用 `gets()`"
-))
-
-data.append(make_entry(
-    "文件读取时多读了一行",
-    "FILE *fp = fopen(filename, \"r\");\nchar line[256];\nwhile (!feof(fp)) {\n    fgets(line, sizeof(line), fp);\n    printf(\"%s\", line);\n}\nfclose(fp);",
-    None,
-    "`feof(fp)` 只有在**读取操作遇到EOF之后**才返回真，所以循环会多执行一次。\n\n**修复：用fgets返回值控制循环**\n```c\nFILE *fp = fopen(filename, \"r\");\nif (!fp) { perror(\"fopen\"); return; }\nchar line[256];\nwhile (fgets(line, sizeof(line), fp) != NULL) {\n    printf(\"%s\", line);\n}\nfclose(fp);\n```\n\n**文件操作要点：** `fopen` 后检查返回值；用 `fgets` 返回值控制循环，不用 `feof`；二进制文件用 `\"rb\"`/`\"wb\"`。"
-))
-
-data.append(make_entry(
-    "这段代码拼接字符串后输出乱码",
-    "char *concat(const char *a, const char *b) {\n    char result[256];\n    sprintf(result, \"%s%s\", a, b);\n    return result;\n}",
-    None,
-    "返回局部数组地址——`result` 在栈上，函数返回后内存被回收，悬垂指针导致乱码。\n\n**推荐修复：调用者提供缓冲区**\n```c\nvoid concat(char *out, size_t out_size, const char *a, const char *b) {\n    snprintf(out, out_size, \"%s%s\", a, b);\n}\n```\n\n**通用规则：** 局部数组地址绝不能作为返回值；字符串操作函数的标准模式是调用者传入缓冲区和大小；用 `snprintf` 而非 `sprintf`。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "char *s = \"hello\";\ns[0] = 'H';\nprintf(\"%s\\n\", s);",
-    None,
-    "**未定义行为**，可能崩溃。`\"hello\"` 是字符串字面量，存储在只读数据区，`s[0] = 'H'` 试图修改只读内存。\n\n**修复：用数组**\n```c\nchar s[] = \"hello\";  // 栈上数组，可修改\ns[0] = 'H';\nprintf(\"%s\\n\", s);  // 输出 Hello\n```\n\n**区别：**\n```c\nchar *s = \"hello\";   // 指向只读字面量，不可修改\nchar s[] = \"hello\";  // 栈上数组，可修改\n```\n\n**最佳实践：** 指向字符串字面量的指针声明为 `const char *`：`const char *s = \"hello\";`"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int arr[5];\nfor (int i = 0; i <= 5; i++) {\n    arr[i] = i * 2;\n}",
-    None,
-    "**Off-by-one 错误**：`i <= 5` 应该是 `i < 5`。当 `i=5` 时，`arr[5]` 越界（有效索引0-4）。\n\n**修复：** `for (int i = 0; i < 5; i++)`\n\n**防越界习惯：**\n1. 用 `#define SIZE 5`，循环用 `i < SIZE`\n2. 用 `sizeof(arr)/sizeof(arr[0])` 计算数组长度\n3. 开启 `-fsanitize=address` 检测越界\n\n**Off-by-one 是最常见的bug之一**，特别注意 `<=` 和 `<` 的选择。半开区间 `[0, n)` 是C语言的标准惯例。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "if (sizeof(int) > -1) {\n    printf(\"int is bigger\\n\");\n} else {\n    printf(\"-1 is bigger\\n\");\n}",
-    None,
-    "输出 `-1 is bigger`。`sizeof` 返回 `size_t`（`unsigned`），`-1` 被隐式转为 `unsigned` 变成 `4294967295`，比4大。\n\n**规则：** 当 `signed` 和 `unsigned` 比较时，`signed` 被转为 `unsigned`，负数变成很大的正数。\n\n**修复：** `if ((int)sizeof(int) > -1)`\n\n**避免signed/unsigned混用：** 循环变量与 `size_t` 比较时也用 `size_t`；不要用 `int` 与 `strlen`/`sizeof` 直接比较；编译加 `-Wsign-compare`。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *p = malloc(sizeof(int));\n*p = 42;\nfree(p);\nprintf(\"%d\\n\", *p);",
-    None,
-    "**Use-After-Free**：`free(p)` 后访问 `*p` 是未定义行为。\n\n**修复：** `free` 后将指针置NULL\n```c\nfree(p);\np = NULL;\n```\n\n后续访问 `p` 会段错误而非读到脏数据，更容易调试。\n\n**相关陷阱：** Double Free（对同一指针 `free` 两次）也会崩溃或破坏堆。\n\n**检测工具：** `gcc -fsanitize=address` 可检测 Use-After-Free 和 Double Free。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "char buf[8];\nscanf(\"%s\", buf);",
-    None,
-    "**缓冲区溢出**。`scanf(\"%s\")` 不限制读取长度，输入超过7个字符就溢出。\n\n**修复：**\n```c\nchar buf[8];\nscanf(\"%7s\", buf);  // 最多读7字符 + '\\0'\n```\n\n**更安全：**\n```c\nchar buf[8];\nfgets(buf, sizeof(buf), stdin);\nbuf[strcspn(buf, \"\\n\")] = '\\0';\n```\n\n**安全编码原则：** 永远不要用不带长度限制的字符串输入函数（`scanf(\"%s\")`、`gets()`、`strcpy`）。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *create_array(int size) {\n    int arr[size];\n    for (int i = 0; i < size; i++) arr[i] = 0;\n    return arr;\n}",
-    None,
-    "两个问题：\n1. **返回局部数组地址**：`arr` 在栈上，函数返回后内存失效\n2. **VLA隐患**：`int arr[size]` 是变长数组，`size` 很大时可能栈溢出\n\n**修复：**\n```c\nint *create_array(int size) {\n    int *arr = calloc(size, sizeof(int));  // 自动清零\n    return arr;\n}\n```\n\n**VLA注意：** C99支持，C11变为可选；大尺寸VLA可能导致栈溢出；生产代码中慎用。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *arr = malloc(n * sizeof(int));\narr[0] = 42;",
-    None,
-    "没有检查 `malloc` 返回值。内存不足时 `malloc` 返回 `NULL`，`arr[0] = 42` 会导致段错误。\n\n**修复：**\n```c\nint *arr = malloc(n * sizeof(int));\nif (arr == NULL) {\n    fprintf(stderr, \"malloc failed\\n\");\n    exit(EXIT_FAILURE);\n}\narr[0] = 42;\n```\n\n**最佳实践：** 每次 `malloc`/`calloc`/`realloc` 后都检查返回值。可封装安全分配函数：\n```c\nvoid *safe_malloc(size_t size) {\n    void *p = malloc(size);\n    if (!p) { fprintf(stderr, \"malloc(%zu) failed\\n\", size); exit(1); }\n    return p;\n}\n```"
-))
-
-data.append(make_entry(
-    "#define宏有哪些常见坑？",
-    "#define SQUARE(x) x * x\nint r = SQUARE(2 + 3);",
-    None,
-    "`SQUARE(2 + 3)` 展开为 `2 + 3 * 2 + 3 = 11`，不是25。\n\n**修复：** `#define SQUARE(x) ((x) * (x))`\n\n**另一个坑：参数有副作用**\n```c\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\nMAX(x++, y++);  // x++ 或 y++ 可能执行两次\n```\n修复：用 `inline` 函数\n```c\nstatic inline int max(int a, int b) { return a > b ? a : b; }\n```\n\n**宏的替代方案：** 常量→`const`/`enum`；带参数宏→`inline`函数；类型别名→`typedef`。何时仍需宏：条件编译、泛型代码。"
-))
-
-data.append(make_entry(
-    "这段代码编译报错 conflicting types for 'foo'，但我只定义了一次",
-    "#include <stdio.h>\nint main(void) {\n    int result = foo(3);\n    printf(\"%d\\n\", result);\n    return 0;\n}\ndouble foo(int x) {\n    return x * 2.5;\n}",
-    None,
-    "编译器遇到 `foo(3)` 时 `foo` 还没声明，会隐式假设返回 `int`。后面实际定义返回 `double`，类型冲突。\n\n**修复：在使用前声明函数**\n```c\ndouble foo(int x);  // 前向声明\n\nint main(void) {\n    int result = foo(3);\n    printf(\"%d\\n\", result);\n    return 0;\n}\n\ndouble foo(int x) {\n    return x * 2.5;\n}\n```\n\n**最佳实践：** 每个函数在头文件中声明，使用前 `#include`，不依赖定义顺序。C99已禁止隐式声明，建议用 `-std=c11 -Wall`。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "for (int i = 0; i < n; i++) {\n    int *p = malloc(sizeof(int));\n    *p = i;\n}\n// 循环结束后无法访问任何分配的内存",
-    None,
-    "两个问题：\n1. **内存泄漏**：每次 `malloc` 分配内存，但 `p` 在下次迭代被覆盖\n2. **无法访问**：循环结束后所有分配的内存都丢失了\n\n**更好的方案：直接用连续内存**\n```c\nint *arr = malloc(n * sizeof(int));\nfor (int i = 0; i < n; i++) arr[i] = i;\n// 使用...\nfree(arr);\n```\n\n一次 `malloc` + 一次 `free`，简单高效。每个 `int` 单独 `malloc` 既浪费内存又影响缓存性能。"
-))
-
-data.append(make_entry(
-    "字符串拼接为什么很慢？如何优化？",
-    "char buf[1024] = \"\";\nstrcat(buf, \"Hello, \");\nstrcat(buf, name);\nstrcat(buf, \"! \");\nstrcat(buf, message);",
-    None,
-    "每次 `strcat` 都从头扫描找 `\\0`，O(n²)——**Schlemiel the Painter 问题**。\n\n**优化：追踪末尾位置**\n```c\nchar buf[1024];\nsize_t pos = 0;\npos += snprintf(buf + pos, sizeof(buf) - pos, \"Hello, \");\npos += snprintf(buf + pos, sizeof(buf) - pos, \"%s\", name);\npos += snprintf(buf + pos, sizeof(buf) - pos, \"! \");\npos += snprintf(buf + pos, sizeof(buf) - pos, \"%s\", message);\n```\n\n每次追加直接在末尾写入，O(n)。其他优化：缓存 `strlen` 结果；已知长度用 `memcpy`；批量操作用 `memset`/`memcmp`。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *p = malloc(sizeof(int));\n*p = 42;\n// 使用p...\n// 忘记free(p)",
-    None,
-    "**内存泄漏**：`malloc` 分配的内存没有 `free`，程序运行期间这块内存一直被占用。\n\n**修复：**\n```c\nint *p = malloc(sizeof(int));\nif (!p) return;\n*p = 42;\n// 使用p...\nfree(p);\np = NULL;\n```\n\n**防泄漏习惯：**\n1. 每写一个 `malloc`，立刻写配对的 `free`，再填充中间逻辑\n2. 遵循\"谁分配谁释放\"原则\n3. 用 Valgrind 或 AddressSanitizer 检测泄漏"
-))
-
-# ---- 新增常见错误 ----
-
-data.append(make_entry(
-    "我的程序崩溃了，提示double free or corruption",
-    "void process(void) {\n    char *buf = malloc(256);\n    // 使用buf...\n    free(buf);\n    // 很多代码后...\n    free(buf);  // 又free了一次\n}",
-    None,
-    "**Double Free**：对同一块内存 `free` 两次，破坏堆的数据结构，导致崩溃或未定义行为。\n\n**修复：free后置NULL**\n```c\nchar *buf = malloc(256);\nif (!buf) return;\n// 使用buf...\nfree(buf);\nbuf = NULL;  // 防止再次free\n```\n\n`free(NULL)` 是安全的（什么都不做），所以置NULL后再free不会出错。\n\n**更根本的解决：** 遵循\"谁分配谁释放\"原则，让分配和释放在同一抽象层。"
-))
-
-data.append(make_entry(
-    "printf输出乱码，而且程序行为很奇怪",
-    "char name[32];\nprintf(\"Enter name: \");\nscanf(\"%s\", name);\nprintf(\"Hello %s\\n\", name);",
-    "printf函数的第一个参数是格式字符串，如果用户输入包含%符号，printf会将其解释为格式说明符，导致读取栈上随机数据甚至崩溃。\n\n**安全做法：** 永远不要将用户输入直接作为printf的第一个参数。\n```c\nprintf(\"%s\", name);  // 正确：用%s格式化\n```\n\n**格式化字符串漏洞是严重的安全问题**，攻击者可通过精心构造的输入读取内存或执行任意代码。",
-    "根据参考文档，这是**格式化字符串漏洞**。`printf(name)` 将用户输入当作格式字符串，如果 `name` 包含 `%s`、`%x`、`%n` 等格式说明符，`printf` 会读取栈上数据甚至写入内存。\n\n**修复：**\n```c\nprintf(\"%s\\n\", name);  // 正确：用%s格式化用户输入\n```\n\n**安全原则：** 永远不要将用户输入直接作为 `printf` 的第一个参数。同理，`fprintf`、`sprintf`、`syslog` 等也要注意。"
-))
-
-data.append(make_entry(
-    "switch语句执行了不该执行的case",
-    "int x = 2;\nswitch (x) {\n    case 1: printf(\"one\\n\");\n    case 2: printf(\"two\\n\");\n    case 3: printf(\"three\\n\");\n}",
-    None,
-    "**缺少 `break`**，导致fall-through。输出 `two\\nthree\\n` 而非仅 `two\\n`。\n\n**修复：**\n```c\nswitch (x) {\n    case 1: printf(\"one\\n\"); break;\n    case 2: printf(\"two\\n\"); break;\n    case 3: printf(\"three\\n\"); break;\n}\n```\n\n**注意：** GCC/Clang 加 `-Wimplicit-fallthrough` 会警告缺少break。如果确实需要fall-through，加注释 `/* fall through */`。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int i = 0;\nwhile (i < 10);\n{\n    printf(\"%d\\n\", i);\n    i++;\n}",
-    None,
-    "`while (i < 10)` 后面多了分号，变成**空循环体**，`i` 永远不变，死循环。\n\n**修复：** 删除分号\n```c\nint i = 0;\nwhile (i < 10)\n{\n    printf(\"%d\\n\", i);\n    i++;\n}\n```\n\n**类似陷阱：** `if (x > 0);` 后加分号也会导致条件体为空。建议 `while`/`if` 后的大括号写在同一行，减少此类错误。"
-))
-
-data.append(make_entry(
-    "malloc分配的内存不够，字符串操作后崩溃",
-    "char *copy_str(const char *s) {\n    char *copy = malloc(strlen(s));\n    strcpy(copy, s);\n    return copy;\n}",
-    None,
-    "**Off-by-one**：`strlen` 不计 `\\0`，但 `strcpy` 会复制包括 `\\0` 在内的所有字符，多写1字节。\n\n**修复：** `malloc(strlen(s) + 1)`\n\n**更安全的写法：**\n```c\nchar *copy_str(const char *s) {\n    size_t len = strlen(s);\n    char *copy = malloc(len + 1);\n    if (!copy) return NULL;\n    memcpy(copy, s, len + 1);\n    return copy;\n}\n```\n\n**字符串分配公式：** `malloc(strlen(s) + 1)`，+1给 `\\0`。"
-))
-
-data.append(make_entry(
-    "用==比较两个字符串是否相等，但结果不对",
-    "char s1[] = \"hello\";\nchar s2[] = \"hello\";\nif (s1 == s2) {\n    printf(\"equal\\n\");\n} else {\n    printf(\"not equal\\n\");  // 总是走这里\n}",
-    None,
-    "`s1 == s2` 比较的是**指针地址**，不是字符串内容。两个不同数组地址不同。\n\n**修复：用strcmp**\n```c\nif (strcmp(s1, s2) == 0) {\n    printf(\"equal\\n\");\n}\n```\n\n**规则：** C语言中字符串比较必须用 `strcmp`/`strncmp`；`==` 只在比较指针是否指向同一地址时使用。"
-))
-
-data.append(make_entry(
-    "scanf读取整数时程序崩溃了",
-    "int x;\nscanf(\"%d\", x);  // 缺少&",
-    None,
-    "`scanf` 需要变量的**地址**来写入值。`scanf(\"%d\", x)` 把 `x` 的值当地址传入，向随机地址写入，崩溃。\n\n**修复：** `scanf(\"%d\", &x);`\n\n**例外：** 数组名和字符串不需要 `&`，因为它们本身就是地址：\n```c\nchar name[32];\nscanf(\"%31s\", name);  // name已经是地址，不需要&\n```"
-))
-
-data.append(make_entry(
-    "递归函数导致栈溢出，程序崩溃",
-    "int factorial(int n) {\n    return n * factorial(n - 1);\n}",
-    None,
-    "**缺少递归终止条件**（base case），无限递归直到栈溢出。\n\n**修复：**\n```c\nint factorial(int n) {\n    if (n <= 1) return 1;  // 终止条件\n    return n * factorial(n - 1);\n}\n```\n\n**递归三要素：** 终止条件、递归调用、问题规模缩小。写递归时先写终止条件。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *arr = malloc(n * sizeof(int));\n// 使用arr...\nfree(arr);\narr[0] = 10;  // 还在使用",
-    None,
-    "**Use-After-Free**：`free(arr)` 后访问 `arr[0]` 是未定义行为，可能崩溃、读到脏数据、或看似正常。\n\n**修复：** free后置NULL\n```c\nfree(arr);\narr = NULL;\n```\n\n后续访问会段错误而非读到脏数据，更容易发现bug。\n\n**检测：** `gcc -fsanitize=address -g program.c && ./a.out`"
-))
-
-data.append(make_entry(
-    "struct的内存对齐规则是什么？sizeof结果比预期大",
-    "struct A {\n    char c;\n    int i;\n    char d;\n};\n// sizeof = 12，不是6",
-    None,
-    "编译器在成员间插入填充字节（padding），使每个成员对齐到其大小的倍数。\n\n**你的例子：** `char c`(1字节) + 填充3字节 + `int i`(4字节) + `char d`(1字节) + 填充3字节 = 12\n\n**优化：按对齐从大到小排列**\n```c\nstruct Good {\n    int i;     // 4字节\n    char c;    // 1字节\n    char d;    // 1字节\n               // 填充2字节\n};  // sizeof = 8\n```\n\n**规则：** 每个成员偏移量必须是其对齐要求的整数倍；结构体总大小必须是最大对齐要求的整数倍。"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "printf(\"%d\\n\", 3.14);\nprintf(\"%f\\n\", 42);",
-    None,
-    "**格式说明符与类型不匹配**，输出垃圾值或崩溃。\n\n**正确用法：**\n```c\nprintf(\"%f\\n\", 3.14);   // double用%f\nprintf(\"%d\\n\", 42);     // int用%d\nprintf(\"%ld\\n\", 42L);   // long用%ld\nprintf(\"%lld\\n\", 42LL); // long long用%lld\nprintf(\"%zu\\n\", n);     // size_t用%zu\n```\n\n**常见错误：** `long` 用 `%d`（64位系统截断）；`size_t` 用 `%d`；`double` 用 `%d`。编译加 `-Wformat` 可检测。"
-))
-
-data.append(make_entry(
-    "Release模式崩溃但Debug正常，可能是什么原因？",
-    None,
-    None,
-    "几乎总是**未定义行为（UB）**——Debug碰巧正确，优化器改变了行为。\n\n**最常见原因：**\n1. **未初始化变量**：Debug栈内存可能恰好为0，Release是随机值\n2. **数组越界**：Debug越界写入可能覆盖不重要的内存\n3. **Use-After-Free**：`free(p); printf(\"%s\", p);` Debug下可能\"正常\"\n4. **有符号整数溢出**：优化器可能假设不会溢出\n5. **严格别名违规**：`int bits = *(int *)&f;` 应用 `memcpy`\n\n**调试：** `gcc -fsanitize=address,undefined -g program.c`\n\n**核心原则：** 依赖UB的代码是定时炸弹，必须严格遵守标准。"
-))
-
-data.append(make_entry(
-    "如何正确实现二维动态数组？",
-    "int **m = malloc(rows * sizeof(int *));\nfor (int i = 0; i < rows; i++)\n    m[i] = malloc(cols * sizeof(int));",
-    None,
-    "你的写法可以但不够高效（每行单独malloc，内存不连续）。\n\n**推荐：一次分配 + 指针数组**\n```c\nint **create_matrix(int rows, int cols) {\n    int **m = malloc(rows * sizeof(int *));\n    int *data = malloc(rows * cols * sizeof(int));\n    for (int i = 0; i < rows; i++)\n        m[i] = data + i * cols;\n    return m;\n}\n\nvoid free_matrix(int **m) {\n    free(m[0]);  // 释放数据区\n    free(m);     // 释放指针数组\n}\n```\n\n**优点：** 数据连续（缓存友好），只需2次malloc，仍可用 `m[i][j]`。"
-))
-
-data.append(make_entry(
-    "malloc、calloc、realloc有什么区别？realloc有什么坑？",
-    None,
-    None,
-    "| 函数 | 初始化 | 用途 |\n|------|--------|------|\n| `malloc(size)` | 否 | 通用分配 |\n| `calloc(n, size)` | 清零 | 需要0初始化 |\n| `realloc(ptr, size)` | 新增部分不初始化 | 扩容/缩容 |\n\n**realloc的坑：**\n1. **不能直接用原指针接收**：`ptr = realloc(ptr, n)` 失败时原指针丢失。正确：用临时指针接收，检查后再赋值\n2. **可能移动内存**：返回新地址时，旧地址失效\n3. **realloc(NULL, size) 等价于 malloc(size)**\n\n**最佳实践：** 用 `sizeof(*ptr)` 代替 `sizeof(type)`：`int *arr = malloc(10 * sizeof(*arr));`"
-))
-
-# ========== 编程规范 ==========
-
-data.append(make_entry(
-    "C语言中static关键字有哪些用法？",
-    None,
-    None,
-    "`static` 有三种不同用法：\n\n**1. 静态局部变量（函数内）**：只初始化一次，值在调用间保持\n```c\nvoid counter(void) { static int count = 0; count++; }\n```\n\n**2. 静态全局变量（函数外）**：只在当前.c文件可见\n```c\nstatic int module_state = 0;\n```\n\n**3. 静态函数**：只在当前.c文件可见\n```c\nstatic int helper(int x) { ... }\n```\n\n**核心记忆：** 函数内延长生命周期，函数外限制可见性。**最佳实践：** 不需要对外暴露的函数和全局变量都应加 `static`。"
-))
-
-data.append(make_entry(
-    "C语言有哪些好的编码规范？",
-    None,
-    None,
-    "**1. 命名规范**：变量/函数用小写+下划线 `student_count`；宏用全大写 `MAX_SIZE`；类型首字母大写 `Vec`\n\n**2. 函数只做一件事**，控制在30行以内\n\n**3. 防御性编程**：`if (!buf) { fprintf(stderr, \"OOM\\n\"); exit(1); }`\n\n**4. const修饰不应修改的参数**：`int sum(const int *arr, int n);`\n\n**5. 谁分配谁释放**，分配和释放在同一层\n\n**6. 头文件保护**：`#ifndef UTILS_H / #define UTILS_H / #endif`\n\n**7. 编译选项**：`gcc -Wall -Wextra -Werror -std=c11 -g program.c`\n\n**8. 用 `sizeof(*ptr)` 代替 `sizeof(type)`**：`int *arr = malloc(10 * sizeof(*arr));`\n\n**9. static修饰不需要对外暴露的函数和全局变量**"
-))
-
-data.append(make_entry(
-    "如何组织多文件项目？经常遇到重复定义和未定义引用",
-    None,
-    None,
-    "**核心原则：头文件放声明，源文件放定义。**\n\n```\nproject/\n├── main.c\n├── math_utils.h    ← 声明\n├── math_utils.c    ← 实现\n└── Makefile\n```\n\n**math_utils.h：**\n```c\n#ifndef MATH_UTILS_H\n#define MATH_UTILS_H\nint max(int a, int b);\n#endif\n```\n\n**常见链接错误：**\n1. \"multiple definition\" → .h中放了定义，应只放 `extern` 声明\n2. \"undefined reference\" → Makefile缺少 .o 文件\n3. \"redefinition\" → 缺少头文件保护\n\n**static的妙用：** 不对外暴露的函数和全局变量加 `static`，避免命名冲突。"
-))
-
-data.append(make_entry(
-    "C语言中如何处理错误？有什么好的错误处理模式？",
-    None,
-    None,
-    "C语言没有异常机制，常见模式：\n\n**1. 返回值表示错误**\n```c\nint divide(int a, int b, int *result) {\n    if (b == 0) return -1;\n    *result = a / b;\n    return 0;\n}\n```\n\n**2. errno机制**\n```c\nFILE *fp = fopen(\"config.txt\", \"r\");\nif (!fp) { perror(\"fopen\"); }\n```\n\n**3. goto清理模式（推荐）**\n```c\nint init(void) {\n    int *buf1 = NULL, *buf2 = NULL;\n    int ret = -1;\n    buf1 = malloc(1024);\n    if (!buf1) goto cleanup;\n    buf2 = malloc(2048);\n    if (!buf2) goto cleanup;\n    ret = 0;\ncleanup:\n    free(buf2);\n    free(buf1);\n    return ret;\n}\n```\n`goto` 用于错误清理是C语言中广泛接受的例外。\n\n**最佳实践：** 永远检查返回值，用 `goto cleanup` 处理多资源释放，用 `perror` 提供错误信息。"
-))
-
-data.append(make_entry(
-    "volatile关键字是做什么用的？",
-    None,
-    None,
-    "`volatile` 告诉编译器：**这个变量可能被程序外部改变，不要优化它。**\n\n**没有volatile的问题：**\n```c\nint flag = 0;\nwhile (flag == 0) { }  // 编译器可能优化为死循环\n```\n\n**加上volatile：**\n```c\nvolatile int flag = 0;\nwhile (flag == 0) { }  // 每次都从内存重新读取\n```\n\n**三大使用场景：** 硬件寄存器映射、信号处理、多线程共享（简单场景）\n\n**注意：** `volatile` 只保证每次从内存读取，**不保证原子性**，不能替代锁。"
-))
-
-data.append(make_entry(
-    "如何写一个Makefile？",
-    None,
-    None,
-    "```makefile\nCC = gcc\nCFLAGS = -Wall -Wextra -std=c11 -g\n\nSRCS = main.c math_utils.c string_utils.c\nOBJS = $(SRCS:.c=.o)\nTARGET = myprogram\n\n$(TARGET): $(OBJS)\n\t$(CC) $(CFLAGS) -o $@ $^\n\n%.o: %.c\n\t$(CC) $(CFLAGS) -c -o $@ $<\n\nclean:\n\trm -f $(OBJS) $(TARGET)\n\n.PHONY: clean\n```\n\n**要点：**\n1. 目标:依赖，下一行Tab缩进命令\n2. `$@` = 目标名，`$<` = 第一个依赖，`$^` = 所有依赖\n3. `.PHONY` 声明伪目标\n4. 变量替换 `$(SRCS:.c=.o)` 批量改后缀\n5. 模式规则 `%.o: %.c` 通用编译规则"
-))
-
-data.append(make_entry(
-    "如何用GDB调试程序？",
-    None,
-    None,
-    "**编译时加 -g：** `gcc -g -Wall program.c -o program`\n\n**基本流程：**\n```bash\ngdb ./program\nbreak main       # 在main设断点\nbreak 42         # 在第42行设断点\nrun              # 运行\nnext             # 单步（不进入函数）\nstep             # 单步（进入函数）\nprint var        # 打印变量\ncontinue         # 继续运行\nbacktrace        # 打印调用栈\nquit\n```\n\n**调试段错误：**\n```bash\ngdb ./program\nrun              # 运行到崩溃\nbacktrace        # 查看崩溃时的调用栈\nframe 2          # 切到第2帧\nprint *ptr       # 查看指针指向的值\n```\n\n**高级：** `watch var` 监视变量变化；`set var x=5` 修改变量；`x/10x arr` 查看内存。"
-))
-
-data.append(make_entry(
-    "C语言中如何正确使用const？",
-    None,
-    None,
-    "`const` 修饰离它最近的类型，从右往左读：\n\n```c\nconst int x = 10;        // x不可修改\nint const y = 20;        // 同上\nconst int *p;            // *p不可修改（指向const int的指针）\nint *const p = &x;       // p不可修改（const指针指向int）\nconst int *const p = &x; // 都不可修改\n```\n\n**函数参数中使用const：**\n```c\nvoid print_array(const int *arr, int n);  // 承诺不修改数组\nchar *my_strcpy(char *dst, const char *src);  // 不修改src\n```\n\n**好处：** 编译器检查意外修改；向调用者传达意图；允许传const和非const参数。\n\n**注意：** `const` 不等于不可变，通过非const指针仍可修改底层对象。"
-))
-
-data.append(make_entry(
-    "如何写好C语言的注释？",
-    None,
-    None,
-    "**注释原则：解释为什么，而非是什么。**\n\n**不好的注释：**\n```c\ni++;  // i加1\n```\n\n**好的注释：**\n```c\ni++;  // 跳过头部标记字节\n```\n\n**文件头注释：**\n```c\n/* file: queue.c\n * 线程安全的循环队列实现\n * 作者: xxx, 日期: 2024-01 */\n```\n\n**函数注释：**\n```c\n/* 在有序数组中二分查找target\n * 返回索引，未找到返回-1\n * arr必须已升序排列 */\nint binary_search(const int *arr, int n, int target);\n```\n\n**不要注释的：** 代码本身能表达的；过时的注释比没注释更危险；注释不能弥补糟糕的命名。"
-))
-
-data.append(make_entry(
-    "typedef和#define定义类型别名有什么区别？",
-    "typedef char *StrPtr1;\n#define StrPtr2 char *\nStrPtr1 a, b;\nStrPtr2 c, d;",
-    None,
-    "关键区别：\n```c\nStrPtr1 a, b;   // a和b都是 char*\nStrPtr2 c, d;   // 展开为 char *c, d; → c是char*，d是char！\n```\n\n`#define` 只是文本替换，多变量声明时出问题。\n\n**推荐：** 给类型起别名**永远用 `typedef`**，更安全、更符合C语言语义。`#define` 只在需要文本替换能力时使用。"
-))
-
-data.append(make_entry(
-    "C语言中enum和宏定义常量相比有什么优缺点？",
-    "#define RED   0\n#define GREEN 1\n#define BLUE  2",
-    None,
-    "**enum的优势：**\n1. **类型检查**：函数参数可声明为 `enum Color`，编译器会检查\n2. **调试友好**：GDB显示 `RED` 而非 `0`\n3. **自动编号**：新增值时自动递增\n4. **switch检查**：编译器可检查是否覆盖所有枚举值\n\n**宏的优势：**\n1. **条件编译**：`#ifdef RED`\n2. **非整数值**：`#define PI 3.14`\n3. **泛型代码生成**\n\n**推荐：** 需要一组相关常量时优先用enum，需要条件编译或非整数值时用宏。\n\n```c\ntypedef enum { RED, GREEN, BLUE } Color;\nColor c = RED;  // 有类型，比 #define RED 0 更安全\n```"
-))
-
-data.append(make_entry(
-    "如何正确使用assert？什么时候用assert，什么时候用错误处理？",
-    None,
-    None,
-    "**选择原则：**\n- **assert**：前置条件/不变量（调用者违反了约定，是bug）\n- **错误处理**：外部输入不可控（用户输入/文件/网络）\n\n```c\nint binary_search(int *arr, int n, int target) {\n    assert(arr != NULL);   // 调用者不应传NULL，是bug → assert\n    assert(n >= 0);\n    // ...\n}\n\nFILE *open_config(const char *path) {\n    FILE *fp = fopen(path, \"r\");\n    if (!fp) {\n        // 文件可能不存在，不是bug → 错误处理\n        perror(\"fopen\");\n        return NULL;\n    }\n    return fp;\n}\n```\n\n**注意：** assert中不要有副作用，Release下会被移除。C11静态断言：`_Static_assert(sizeof(int)==4, \"int must be 4 bytes\");`"
-))
-
-data.append(make_entry(
-    "如何处理命令行参数？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <string.h>\n\nint main(int argc, char *argv[]) {\n    const char *output = \"default.txt\";\n    int verbose = 0;\n    \n    for (int i = 1; i < argc; i++) {\n        if (strcmp(argv[i], \"-h\") == 0) {\n            printf(\"Usage: %s [-h] [-o file] [-v]\\n\", argv[0]);\n            return 0;\n        } else if (strcmp(argv[i], \"-o\") == 0) {\n            if (i + 1 >= argc) {\n                fprintf(stderr, \"-o needs argument\\n\");\n                return 1;\n            }\n            output = argv[++i];\n        } else if (strcmp(argv[i], \"-v\") == 0) {\n            verbose = 1;\n        }\n    }\n    return 0;\n}\n```\n\n- `argc`：参数个数（含程序名），`argv[0]`：程序名\n- 带参数的选项（如 `-o file`）要检查 `i+1 < argc`\n- POSIX系统可用 `getopt()` 更规范地解析"
-))
-
-data.append(make_entry(
-    "如何实现回调函数？",
-    None,
-    None,
-    "回调函数通过函数指针实现，核心模式是**带 `void *user_data` 的回调**：\n\n```c\ntypedef void (*Callback)(const char *event, void *user_data);\n\ntypedef struct {\n    Callback on_event;\n    void *user_data;\n} EventEmitter;\n\nvoid emitter_trigger(EventEmitter *em, const char *event) {\n    if (em->on_event) em->on_event(event, em->user_data);\n}\n\n// 使用\nvoid log_event(const char *event, void *user_data) {\n    printf(\"%s\\n\", event);\n}\n\nint main(void) {\n    EventEmitter em = {log_event, NULL};\n    emitter_trigger(&em, \"startup\");\n    return 0;\n}\n```\n\n`void *user_data` 是C回调的标准设计，传递任意上下文，避免全局变量。\n\n**典型场景：** `qsort`比较函数、事件驱动、定时器回调、插件系统。"
-))
-
-data.append(make_entry(
-    "C语言中如何实现简单的面向对象？封装、继承和多态",
-    None,
-    None,
-    "C语言可通过结构体+函数指针模拟OOP：\n\n**封装：** 结构体+操作函数，用 `const` 限制修改\n```c\ntypedef struct { int x, y; } Point;\nPoint point_new(int x, int y) { return (Point){x, y}; }\ndouble point_dist(const Point *a, const Point *b) { ... }\n```\n\n**继承（结构体嵌套）：**\n```c\ntypedef struct { char name[32]; int age; } Person;\ntypedef struct { Person base; float gpa; } Student;\nStudent s;\nPerson *p = (Person *)&s;  // 安全：base是第一个成员\n```\n\n**多态（虚函数表）：**\n```c\ntypedef struct { double (*area)(const void *self); } ShapeVTable;\ntypedef struct { const ShapeVTable *vtable; } Shape;\ndouble shape_area(const Shape *s) { return s->vtable->area(s); }\n```\n\n这种模式在Linux内核（file_operations）和GObject中广泛使用。"
-))
-
-data.append(make_entry(
-    "C语言中如何正确使用union？和struct有什么区别？",
-    None,
-    None,
-    "**核心区别：** `struct` 成员各自占独立内存，`union` 所有成员共享同一块内存（大小=最大成员）。\n\n**最常见用法：类型标签（Tagged Union）**\n```c\ntypedef enum { INT_VAL, FLOAT_VAL } ValueType;\ntypedef struct {\n    ValueType tag;\n    union {\n        int int_val;\n        double float_val;\n    } data;\n} Value;\n\nvoid print_value(const Value *v) {\n    switch (v->tag) {\n        case INT_VAL:   printf(\"%d\\n\", v->data.int_val); break;\n        case FLOAT_VAL: printf(\"%f\\n\", v->data.float_val); break;\n    }\n}\n```\n\n**注意：** 写入一个成员后读另一个是实现定义行为。`tag` 字段用来跟踪当前活跃成员。"
-))
-
-data.append(make_entry(
-    "如何用位操作设置、清除、切换标志位？",
-    None,
-    None,
-    "```c\nunsigned int flags = 0;\nflags |= (1U << n);    // 设置第n位\nflags &= ~(1U << n);   // 清除第n位\nflags ^= (1U << n);    // 切换第n位\nif (flags & (1U << n)) // 检查第n位\n```\n\n**权限标志示例：**\n```c\n#define PERM_READ   (1U << 0)\n#define PERM_WRITE  (1U << 1)\n#define PERM_EXEC   (1U << 2)\nunsigned int perm = PERM_READ | PERM_EXEC;\nperm &= ~PERM_EXEC;      // 移除执行权限\nif (perm & PERM_READ) {}  // 检查读权限\n```\n\n**常用技巧：** 判断2的幂：`n != 0 && (n & (n-1)) == 0`"
-))
-
-# ========== 经典算法案例 ==========
-
-data.append(make_entry(
-    "如何用C语言实现一个动态数组？类似C++的vector",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdlib.h>\n\ntypedef struct {\n    int *data;\n    size_t size;\n    size_t capacity;\n} Vec;\n\nVec vec_new(void) {\n    Vec v;\n    v.data = malloc(4 * sizeof(int));\n    v.size = 0;\n    v.capacity = 4;\n    return v;\n}\n\nvoid vec_push(Vec *v, int value) {\n    if (v->size == v->capacity) {\n        v->capacity *= 2;\n        int *tmp = realloc(v->data, v->capacity * sizeof(int));\n        if (!tmp) { fprintf(stderr, \"OOM\\n\"); exit(1); }\n        v->data = tmp;\n    }\n    v->data[v->size++] = value;\n}\n\nvoid vec_free(Vec *v) {\n    free(v->data);\n    v->data = NULL;\n    v->size = v->capacity = 0;\n}\n```\n\n**关键设计：** 扩容翻倍→均摊O(1)；`realloc`用临时指针接收→防失败丢失原指针；初始容量4→避免频繁扩容。"
-))
-
-data.append(make_entry(
-    "如何实现一个单链表？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdlib.h>\n\ntypedef struct Node {\n    int data;\n    struct Node *next;\n} Node;\n\nNode *list_prepend(Node *head, int data) {\n    Node *n = malloc(sizeof(Node));\n    n->data = data;\n    n->next = head;\n    return n;\n}\n\nNode *list_append(Node *head, int data) {\n    Node *n = malloc(sizeof(Node));\n    n->data = data;\n    n->next = NULL;\n    if (!head) return n;\n    Node *cur = head;\n    while (cur->next) cur = cur->next;\n    cur->next = n;\n    return head;\n}\n\nNode *list_remove(Node *head, int target) {\n    if (!head) return NULL;\n    if (head->data == target) {\n        Node *tmp = head->next;\n        free(head);\n        return tmp;\n    }\n    Node *cur = head;\n    while (cur->next && cur->next->data != target)\n        cur = cur->next;\n    if (cur->next) {\n        Node *tmp = cur->next;\n        cur->next = tmp->next;\n        free(tmp);\n    }\n    return head;\n}\n\nvoid list_free(Node *head) {\n    while (head) {\n        Node *tmp = head->next;\n        free(head);\n        head = tmp;\n    }\n}\n```\n\n**要点：** 头插/删需返回新头指针；`list_free` 先保存 `next` 再 `free`；所有操作处理 `head == NULL`。"
-))
-
-data.append(make_entry(
-    "如何用栈检查括号匹配？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct { char *data; int top; int cap; } Stack;\nStack stack_new(int cap) {\n    Stack s; s.data = malloc(cap); s.top = -1; s.cap = cap; return s;\n}\nvoid stack_push(Stack *s, char c) { s->data[++s->top] = c; }\nchar stack_pop(Stack *s) { return s->data[s->top--]; }\nint stack_empty(Stack *s) { return s->top < 0; }\nchar stack_peek(Stack *s) { return s->data[s->top]; }\n\nint is_match(char a, char b) {\n    return (a=='('&&b==')') || (a=='['&&b==']') || (a=='{'&&b=='}');\n}\n\nint check(const char *s) {\n    Stack st = stack_new(strlen(s));\n    for (int i = 0; s[i]; i++) {\n        if (s[i]=='('||s[i]=='['||s[i]=='{') stack_push(&st, s[i]);\n        else if (s[i]==')'||s[i]==']'||s[i]=='}') {\n            if (stack_empty(&st) || !is_match(stack_peek(&st), s[i])) return 0;\n            stack_pop(&st);\n        }\n    }\n    return stack_empty(&st);\n}\n```\n\n**算法：** 左括号入栈，右括号检查栈顶是否匹配。三种不匹配：右括号与栈顶不配、栈空遇右括号、结束后栈非空。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的哈希表？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n#define TABLE_SIZE 64\n\ntypedef struct Entry {\n    char *key;\n    int value;\n    struct Entry *next;\n} Entry;\n\ntypedef struct { Entry *buckets[TABLE_SIZE]; } HashTable;\n\nunsigned long hash(const char *s) {\n    unsigned long h = 5381;\n    while (*s) h = h * 33 + *s++;\n    return h % TABLE_SIZE;\n}\n\nHashTable *ht_new(void) { return calloc(1, sizeof(HashTable)); }\n\nvoid ht_set(HashTable *ht, const char *key, int val) {\n    unsigned long idx = hash(key);\n    Entry *e = ht->buckets[idx];\n    while (e) {\n        if (strcmp(e->key, key) == 0) { e->value = val; return; }\n        e = e->next;\n    }\n    Entry *n = malloc(sizeof(Entry));\n    n->key = strdup(key);\n    n->value = val;\n    n->next = ht->buckets[idx];\n    ht->buckets[idx] = n;\n}\n\nint ht_get(HashTable *ht, const char *key, int *out) {\n    Entry *e = ht->buckets[hash(key)];\n    while (e) {\n        if (strcmp(e->key, key) == 0) { *out = e->value; return 1; }\n        e = e->next;\n    }\n    return 0;\n}\n```\n\n**设计：** djb2哈希 + 链地址法。`ht_get` 返回bool区分\"key不存在\"和\"值为0\"。"
-))
-
-data.append(make_entry(
-    "如何实现冒泡排序？",
-    None,
-    None,
-    "```c\nvoid bubble_sort(int arr[], int n) {\n    for (int i = 0; i < n - 1; i++) {\n        int swapped = 0;\n        for (int j = 0; j < n - 1 - i; j++) {\n            if (arr[j] > arr[j + 1]) {\n                int tmp = arr[j]; arr[j] = arr[j+1]; arr[j+1] = tmp;\n                swapped = 1;\n            }\n        }\n        if (!swapped) break;\n    }\n}\n```\n\n**要点：** `swapped` 优化——某轮无交换则提前终止；时间O(n²)，最好O(n)（已有序）；空间O(1)。实际项目优先用 `qsort`。"
-))
-
-data.append(make_entry(
-    "如何实现快速排序？",
-    None,
-    None,
-    "```c\nvoid swap(int *a, int *b) { int t = *a; *a = *b; *b = t; }\n\nint partition(int arr[], int low, int high) {\n    int pivot = arr[high];\n    int i = low;\n    for (int j = low; j < high; j++)\n        if (arr[j] <= pivot) swap(&arr[i++], &arr[j]);\n    swap(&arr[i], &arr[high]);\n    return i;\n}\n\nvoid quick_sort(int arr[], int low, int high) {\n    if (low < high) {\n        int pi = partition(arr, low, high);\n        quick_sort(arr, low, pi - 1);\n        quick_sort(arr, pi + 1, high);\n    }\n}\n```\n\n**要点：** 选最后一个元素为pivot；平均O(n log n)，最坏O(n²)；实际项目用 `qsort`。"
-))
-
-data.append(make_entry(
-    "斐波那契数列递归和迭代哪个好？",
-    None,
-    None,
-    "**递归（不推荐）：** `fib(n-1) + fib(n-2)` → O(2^n)，大量重复计算\n\n**迭代（推荐）：**\n```c\nint fib(int n) {\n    if (n <= 1) return n;\n    int a = 0, b = 1;\n    for (int i = 2; i <= n; i++) {\n        int tmp = a + b;\n        a = b;\n        b = tmp;\n    }\n    return b;  // O(n), O(1)空间\n}\n```\n\n**记忆化递归：** 用数组缓存已计算值，O(n)。\n\n**结论：** 简单线性问题优先用迭代，递归适合分治（快排、归并排序）。"
-))
-
-data.append(make_entry(
-    "如何实现归并排序？",
-    None,
-    None,
-    "```c\n#include <stdlib.h>\n#include <string.h>\n\nvoid merge(int arr[], int l, int m, int r) {\n    int n1 = m - l + 1, n2 = r - m;\n    int *L = malloc(n1 * sizeof(int)), *R = malloc(n2 * sizeof(int));\n    memcpy(L, arr + l, n1 * sizeof(int));\n    memcpy(R, arr + m + 1, n2 * sizeof(int));\n    int i = 0, j = 0, k = l;\n    while (i < n1 && j < n2)\n        arr[k++] = L[i] <= R[j] ? L[i++] : R[j++];\n    while (i < n1) arr[k++] = L[i++];\n    while (j < n2) arr[k++] = R[j++];\n    free(L); free(R);\n}\n\nvoid merge_sort(int arr[], int l, int r) {\n    if (l < r) {\n        int m = l + (r - l) / 2;\n        merge_sort(arr, l, m);\n        merge_sort(arr, m + 1, r);\n        merge(arr, l, m, r);\n    }\n}\n```\n\n**要点：** 稳定排序；时间O(n log n)，空间O(n)；适合链表排序和外部排序。"
-))
-
-data.append(make_entry(
-    "如何实现二叉搜索树（BST）？",
-    None,
-    None,
-    "```c\n#include <stdlib.h>\n\ntypedef struct Node {\n    int val;\n    struct Node *left, *right;\n} Node;\n\nNode *bst_insert(Node *root, int val) {\n    if (!root) {\n        Node *n = calloc(1, sizeof(Node));\n        n->val = val;\n        return n;\n    }\n    if (val < root->val) root->left = bst_insert(root->left, val);\n    else if (val > root->val) root->right = bst_insert(root->right, val);\n    return root;\n}\n\nNode *bst_search(Node *root, int val) {\n    if (!root || root->val == val) return root;\n    return val < root->val ? bst_search(root->left, val) : bst_search(root->right, val);\n}\n\nNode *bst_min(Node *root) {\n    while (root && root->left) root = root->left;\n    return root;\n}\n\nNode *bst_delete(Node *root, int val) {\n    if (!root) return NULL;\n    if (val < root->val) root->left = bst_delete(root->left, val);\n    else if (val > root->val) root->right = bst_delete(root->right, val);\n    else {\n        if (!root->left) { Node *r = root->right; free(root); return r; }\n        if (!root->right) { Node *r = root->left; free(root); return r; }\n        Node *succ = bst_min(root->right);\n        root->val = succ->val;\n        root->right = bst_delete(root->right, succ->val);\n    }\n    return root;\n}\n```\n\n**要点：** 左<根<右；查找/插入平均O(log n)；删除两子节点用后继替换；中序遍历得有序序列。"
-))
-
-data.append(make_entry(
-    "如何实现二叉树的遍历？",
-    None,
-    None,
-    "```c\ntypedef struct TreeNode {\n    int val;\n    struct TreeNode *left, *right;\n} TreeNode;\n\nvoid preorder(TreeNode *root) {\n    if (!root) return;\n    printf(\"%d \", root->val);\n    preorder(root->left);\n    preorder(root->right);\n}\n\nvoid inorder(TreeNode *root) {\n    if (!root) return;\n    inorder(root->left);\n    printf(\"%d \", root->val);\n    inorder(root->right);\n}\n\nvoid postorder(TreeNode *root) {\n    if (!root) return;\n    postorder(root->left);\n    postorder(root->right);\n    printf(\"%d \", root->val);\n}\n```\n\n**要点：**\n1. 前序（根-左-右）：复制树、序列化\n2. 中序（左-根-右）：BST中序遍历得有序序列\n3. 后序（左-右-根）：释放树（先释放子树再释放根）\n4. 时间O(n)，空间O(h)（h为树高）"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的队列？",
-    None,
-    None,
-    "```c\n#include <stdlib.h>\n\ntypedef struct Node { int data; struct Node *next; } Node;\n\ntypedef struct {\n    Node *head;\n    Node *tail;\n    int size;\n} Queue;\n\nQueue queue_new(void) { return (Queue){NULL, NULL, 0}; }\n\nvoid queue_push(Queue *q, int val) {\n    Node *n = malloc(sizeof(Node));\n    n->data = val;\n    n->next = NULL;\n    if (q->tail) q->tail->next = n;\n    else q->head = n;\n    q->tail = n;\n    q->size++;\n}\n\nint queue_pop(Queue *q) {\n    if (!q->head) return -1;\n    Node *tmp = q->head;\n    int val = tmp->data;\n    q->head = tmp->next;\n    if (!q->head) q->tail = NULL;\n    free(tmp);\n    q->size--;\n    return val;\n}\n\nint queue_empty(Queue *q) { return q->size == 0; }\n```\n\n**设计要点：** 维护 `head` 和 `tail`，入队出队均O(1)；队列为空时 `tail` 也要置NULL。"
-))
-
-data.append(make_entry(
-    "如何实现通用排序函数，能排序任意类型？",
-    None,
-    None,
-    "用 `void*` + 函数指针 + 元素大小：\n\n```c\n#include <string.h>\n\nvoid swap_generic(void *a, void *b, size_t size) {\n    char tmp[256];\n    if (size > sizeof(tmp)) return;\n    memcpy(tmp, a, size);\n    memcpy(a, b, size);\n    memcpy(b, tmp, size);\n}\n\nvoid my_qsort(void *base, size_t n, size_t size,\n              int (*cmp)(const void *, const void *)) {\n    if (n <= 1) return;\n    char *arr = base;\n    char *pivot = arr + (n-1) * size;\n    size_t i = 0;\n    for (size_t j = 0; j < n-1; j++)\n        if (cmp(arr + j*size, pivot) <= 0)\n            swap_generic(arr + i*size, arr + j*size, size), i++;\n    swap_generic(arr + i*size, pivot, size);\n    my_qsort(arr, i, size, cmp);\n    my_qsort(arr + (i+1)*size, n-i-1, size, cmp);\n}\n```\n\n**关键技术：** `(char *)base + i * size` 计算第i个元素地址；`memcpy` 代替赋值；比较函数指针由调用者提供。比较函数不要用减法，可能溢出。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的内存池？频繁分配释放小对象效率低",
-    None,
-    None,
-    "```c\n#include <stdlib.h>\n#include <stdint.h>\n\ntypedef struct {\n    uint8_t *buffer;\n    size_t block_size;\n    size_t free_count;\n    void *free_list;\n} MemPool;\n\nMemPool pool_create(size_t block_size, size_t count) {\n    MemPool p;\n    p.block_size = block_size < sizeof(void*) ? sizeof(void*) : block_size;\n    p.free_count = count;\n    p.buffer = malloc(p.block_size * count);\n    p.free_list = p.buffer;\n    uint8_t *blk = p.buffer;\n    for (size_t i = 0; i < count - 1; i++) {\n        *(void**)blk = blk + p.block_size;\n        blk += p.block_size;\n    }\n    *(void**)blk = NULL;\n    return p;\n}\n\nvoid *pool_alloc(MemPool *p) {\n    if (!p->free_count) return NULL;\n    void *blk = p->free_list;\n    p->free_list = *(void**)blk;\n    p->free_count--;\n    return blk;\n}\n\nvoid pool_free(MemPool *p, void *blk) {\n    *(void**)blk = p->free_list;\n    p->free_list = blk;\n    p->free_count++;\n}\n```\n\n**原理：** 预分配连续内存，空闲块用内置链表串起来。分配O(1)，释放O(1)。适用于频繁创建/销毁相同类型对象。"
-))
-
-# ---- 新增算法 ----
-
-data.append(make_entry(
-    "如何实现插入排序？",
-    None,
-    None,
-    "```c\nvoid insertion_sort(int arr[], int n) {\n    for (int i = 1; i < n; i++) {\n        int key = arr[i];\n        int j = i - 1;\n        while (j >= 0 && arr[j] > key) {\n            arr[j + 1] = arr[j];\n            j--;\n        }\n        arr[j + 1] = key;\n    }\n}\n```\n\n**要点：** 稳定排序；时间O(n²)，最好O(n)（已有序）；空间O(1)；小数据量或近乎有序时比快排更快；常作为快排/归并排序的子过程（小区间切换到插入排序）。"
-))
-
-data.append(make_entry(
-    "如何实现选择排序？",
-    None,
-    None,
-    "```c\nvoid selection_sort(int arr[], int n) {\n    for (int i = 0; i < n - 1; i++) {\n        int min_idx = i;\n        for (int j = i + 1; j < n; j++)\n            if (arr[j] < arr[min_idx]) min_idx = j;\n        if (min_idx != i) {\n            int tmp = arr[i]; arr[i] = arr[min_idx]; arr[min_idx] = tmp;\n        }\n    }\n}\n```\n\n**要点：** 不稳定排序（交换可能改变相等元素顺序）；时间O(n²)，空间O(1)；交换次数最少（最多n-1次）；适合交换代价大的场景。"
-))
-
-data.append(make_entry(
-    "如何实现图的DFS和BFS遍历？",
-    None,
-    None,
-    "```c\n#define MAX_V 100\n\ntypedef struct { int adj[MAX_V][MAX_V]; int v; } Graph;\n\nint visited[MAX_V];\n\nvoid dfs(Graph *g, int start) {\n    visited[start] = 1;\n    printf(\"%d \", start);\n    for (int i = 0; i < g->v; i++)\n        if (g->adj[start][i] && !visited[i])\n            dfs(g, i);\n}\n\nvoid bfs(Graph *g, int start) {\n    int queue[MAX_V], front = 0, rear = 0;\n    int vis[MAX_V] = {0};\n    queue[rear++] = start;\n    vis[start] = 1;\n    while (front < rear) {\n        int cur = queue[front++];\n        printf(\"%d \", cur);\n        for (int i = 0; i < g->v; i++)\n            if (g->adj[cur][i] && !vis[i]) {\n                queue[rear++] = i;\n                vis[i] = 1;\n            }\n    }\n}\n```\n\n**DFS：** 栈/递归，适合路径搜索、连通性检测。**BFS：** 队列，适合最短路径（无权图）、层序遍历。"
-))
-
-data.append(make_entry(
-    "如何实现0-1背包问题（动态规划）？",
-    None,
-    None,
-    "```c\nint knapsack(int W, int wt[], int val[], int n) {\n    int dp[n + 1][W + 1];\n    for (int i = 0; i <= n; i++)\n        for (int w = 0; w <= W; w++) {\n            if (i == 0 || w == 0) dp[i][w] = 0;\n            else if (wt[i-1] <= w)\n                dp[i][w] = val[i-1] + dp[i-1][w - wt[i-1]] > dp[i-1][w]\n                           ? val[i-1] + dp[i-1][w - wt[i-1]] : dp[i-1][w];\n            else dp[i][w] = dp[i-1][w];\n        }\n    return dp[n][W];\n}\n```\n\n**状态转移：** `dp[i][w]` = 前i个物品、容量w时的最大价值\n- 不选物品i：`dp[i-1][w]`\n- 选物品i：`val[i-1] + dp[i-1][w-wt[i-1]]`\n\n**空间优化：** 用一维数组逆序遍历：`dp[w] = max(dp[w], val[i]+dp[w-wt[i]])`，O(W)空间。"
-))
-
-data.append(make_entry(
-    "如何实现最长公共子序列（LCS）？",
-    None,
-    None,
-    "```c\n#include <string.h>\n\nint lcs(const char *s1, const char *s2) {\n    int m = strlen(s1), n = strlen(s2);\n    int dp[m + 1][n + 1];\n    for (int i = 0; i <= m; i++)\n        for (int j = 0; j <= n; j++) {\n            if (i == 0 || j == 0) dp[i][j] = 0;\n            else if (s1[i-1] == s2[j-1]) dp[i][j] = dp[i-1][j-1] + 1;\n            else dp[i][j] = dp[i-1][j] > dp[i][j-1] ? dp[i-1][j] : dp[i][j-1];\n        }\n    return dp[m][n];\n}\n```\n\n**状态转移：** 字符相同→`dp[i-1][j-1]+1`；不同→`max(dp[i-1][j], dp[i][j-1])`\n\n**回溯路径：** 从 `dp[m][n]` 往回走，相同字符加入结果。时间O(mn)，空间可优化到O(min(m,n))。"
-))
-
-data.append(make_entry(
-    "双指针技巧是什么？有哪些典型应用？",
-    None,
-    None,
-    "双指针用两个索引/指针协同遍历，将O(n²)降为O(n)：\n\n**1. 对撞指针（有序数组两数之和）**\n```c\nint *two_sum(int *arr, int n, int target) {\n    int left = 0, right = n - 1;\n    static int result[2];\n    while (left < right) {\n        int sum = arr[left] + arr[right];\n        if (sum == target) { result[0]=left; result[1]=right; return result; }\n        else if (sum < target) left++;\n        else right--;\n    }\n    return NULL;\n}\n```\n\n**2. 快慢指针（找链表中点/环检测）**\n```c\nint has_cycle(Node *head) {\n    Node *slow = head, *fast = head;\n    while (fast && fast->next) {\n        slow = slow->next;\n        fast = fast->next->next;\n        if (slow == fast) return 1;\n    }\n    return 0;\n}\n```\n\n**3. 滑动窗口（最长无重复子串）**：右指针扩展，左指针收缩。"
-))
-
-data.append(make_entry(
-    "如何实现N皇后问题（回溯法）？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdlib.h>\n\nint solve_nq(int n) {\n    int *cols = calloc(n, sizeof(int));\n    int count = 0;\n    void backtrack(int row) {\n        if (row == n) { count++; return; }\n        for (int col = 0; col < n; col++) {\n            int ok = 1;\n            for (int r = 0; r < row; r++)\n                if (cols[r] == col || abs(cols[r]-col) == abs(r-row))\n                    { ok = 0; break; }\n            if (ok) { cols[row] = col; backtrack(row + 1); }\n        }\n    }\n    backtrack(0);\n    free(cols);\n    return count;\n}\n```\n\n**回溯三步：** 选择→递归→撤销。冲突检测：同列 `cols[r]==col`；对角线 `|cols[r]-col|==|r-row|`。\n\n**时间：** O(n!)，n=8时92个解。"
-))
-
-data.append(make_entry(
-    "如何实现二叉树的层序遍历？",
-    None,
-    None,
-    "```c\ntypedef struct TreeNode {\n    int val;\n    struct TreeNode *left, *right;\n} TreeNode;\n\nvoid level_order(TreeNode *root) {\n    if (!root) return;\n    TreeNode *queue[1000];\n    int front = 0, rear = 0;\n    queue[rear++] = root;\n    while (front < rear) {\n        TreeNode *node = queue[front++];\n        printf(\"%d \", node->val);\n        if (node->left) queue[rear++] = node->left;\n        if (node->right) queue[rear++] = node->right;\n    }\n}\n```\n\n**要点：** 用队列实现BFS；时间O(n)，空间O(w)（w为最大宽度）；如需按层分组，在每层开始时记录队列长度。"
-))
-
-data.append(make_entry(
-    "如何实现堆排序？",
-    None,
-    None,
-    "```c\nvoid swap(int *a, int *b) { int t = *a; *a = *b; *b = t; }\n\nvoid heapify(int arr[], int n, int i) {\n    int largest = i;\n    int l = 2*i + 1, r = 2*i + 2;\n    if (l < n && arr[l] > arr[largest]) largest = l;\n    if (r < n && arr[r] > arr[largest]) largest = r;\n    if (largest != i) {\n        swap(&arr[i], &arr[largest]);\n        heapify(arr, n, largest);\n    }\n}\n\nvoid heap_sort(int arr[], int n) {\n    for (int i = n/2 - 1; i >= 0; i--) heapify(arr, n, i);\n    for (int i = n - 1; i > 0; i--) {\n        swap(&arr[0], &arr[i]);\n        heapify(arr, i, 0);\n    }\n}\n```\n\n**要点：** 建堆O(n)；排序O(n log n)；不稳定；空间O(1)；适合找前k大/小元素（部分堆排序）。"
-))
-
-data.append(make_entry(
-    "如何反转字符串？原地反转",
-    None,
-    None,
-    "```c\nvoid str_reverse(char *s) {\n    int left = 0, right = strlen(s) - 1;\n    while (left < right) {\n        char tmp = s[left];\n        s[left] = s[right];\n        s[right] = tmp;\n        left++;\n        right--;\n    }\n}\n```\n\n**要点：** 双指针对撞交换；O(n)时间，O(1)空间；注意 `strlen(s)-1` 是最后一个字符的索引（不含 `\\0`）。"
-))
-
-data.append(make_entry(
-    "如何实现Dijkstra最短路径算法？",
-    None,
-    None,
-    "```c\n#include <limits.h>\n#include <stdbool.h>\n\n#define V 5\n#define INF INT_MAX\n\nint min_dist(int dist[], bool visited[]) {\n    int min = INF, idx = -1;\n    for (int v = 0; v < V; v++)\n        if (!visited[v] && dist[v] <= min) { min = dist[v]; idx = v; }\n    return idx;\n}\n\nvoid dijkstra(int graph[V][V], int src) {\n    int dist[V];\n    bool visited[V] = {false};\n    for (int i = 0; i < V; i++) dist[i] = INF;\n    dist[src] = 0;\n    for (int count = 0; count < V - 1; count++) {\n        int u = min_dist(dist, visited);\n        visited[u] = true;\n        for (int v = 0; v < V; v++)\n            if (!visited[v] && graph[u][v] && dist[u] != INF\n                && dist[u] + graph[u][v] < dist[v])\n                dist[v] = dist[u] + graph[u][v];\n    }\n}\n```\n\n**要点：** 贪心算法，只适用于非负权边；朴素实现O(V²)；用优先队列优化到O(E log V)；不能处理负权边（用Bellman-Ford）。"
-))
-
-# ========== 带参考文档的样本 ==========
-
-data.append(make_entry(
-    "我的链表删除节点后程序崩溃了，请帮我看看",
-    "typedef struct Node {\n    int data;\n    struct Node *next;\n} Node;\n\nvoid delete_node(Node *head, int target) {\n    Node *cur = head;\n    while (cur && cur->data != target)\n        cur = cur->next;\n    if (cur) free(cur);\n}",
-    "链表删除节点时，必须先将被删除节点的前驱节点的next指针指向后继节点，否则链表断裂。正确步骤：1.找到目标节点及其前驱 2.前驱的next指向目标节点的next 3.释放目标节点。如果删除的是头节点，需要更新头指针。",
-    "根据参考文档，你的代码有两个问题：\n1. **没有修改前驱的next指针**：`free(cur)` 后，前驱节点的 `next` 仍指向已释放的内存（悬垂指针），后续访问崩溃\n2. **没有处理头节点**：如果删除的是头节点，调用者的头指针不会更新\n\n**修复：**\n```c\nNode *delete_node(Node *head, int target) {\n    if (!head) return NULL;\n    if (head->data == target) {\n        Node *tmp = head->next;\n        free(head);\n        return tmp;  // 返回新头\n    }\n    Node *prev = head, *cur = head->next;\n    while (cur && cur->data != target) {\n        prev = cur;\n        cur = cur->next;\n    }\n    if (cur) {\n        prev->next = cur->next;  // 前驱指向后继\n        free(cur);\n    }\n    return head;\n}\n```\n\n**关键步骤：** 前驱next指向后继→释放目标节点→返回头指针。"
-))
-
-data.append(make_entry(
-    "如何实现字符串查找？我想在一个字符串中找子串",
-    None,
-    "C标准库提供了strstr函数用于查找子串：char *strstr(const char *haystack, const char *needle); 返回第一次出现的位置指针，未找到返回NULL。时间复杂度为O(n*m)，n为haystack长度，m为needle长度。如需更高效率，可使用KMP算法，时间复杂度O(n+m)。",
-    "根据参考文档，最简单的方式是使用标准库 `strstr`：\n```c\n#include <string.h>\nchar *found = strstr(text, pattern);\nif (found) printf(\"找到，位置：%ld\\n\", found - text);\n```\n\n如果需要更高效率（多次查找），可用**KMP算法**：\n```c\nvoid build_lps(const char *pat, int *lps, int m) {\n    int len = 0; lps[0] = 0;\n    int i = 1;\n    while (i < m) {\n        if (pat[i] == pat[len]) lps[i++] = ++len;\n        else if (len) len = lps[len - 1];\n        else lps[i++] = 0;\n    }\n}\n\nint kmp_search(const char *txt, const char *pat) {\n    int n = strlen(txt), m = strlen(pat);\n    int *lps = malloc(m * sizeof(int));\n    build_lps(pat, lps, m);\n    int i = 0, j = 0;\n    while (i < n) {\n        if (txt[i] == pat[j]) { i++; j++; }\n        if (j == m) { free(lps); return i - j; }\n        else if (i < n && txt[i] != pat[j]) {\n            if (j) j = lps[j-1]; else i++;\n        }\n    }\n    free(lps); return -1;\n}\n```\n\n**KMP核心：** LPS数组避免重复比较，O(n+m)时间。"
-))
-
-data.append(make_entry(
-    "如何正确使用qsort对结构体数组排序？",
-    "typedef struct {\n    char name[32];\n    int score;\n} Student;\n\nStudent students[100];\n// 如何按score排序？",
-    "qsort函数原型：void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)); 比较函数返回值：负数表示a<b，0表示相等，正数表示a>b。比较函数中不要用减法（可能溢出），应使用条件判断。",
-    "根据参考文档，使用 `qsort` 需要提供比较函数：\n```c\nint cmp_by_score(const void *a, const void *b) {\n    const Student *sa = (const Student *)a;\n    const Student *sb = (const Student *)b;\n    if (sa->score < sb->score) return -1;\n    if (sa->score > sb->score) return 1;\n    return 0;\n}\n\nqsort(students, 100, sizeof(Student), cmp_by_score);\n```\n\n**注意：** 比较函数中**不要用减法** `return sa->score - sb->score`，因为整数溢出会导致排序错误。用条件判断最安全。\n\n**按字符串排序：** `return strcmp(sa->name, sb->name);`"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "void process(int *data, int size) {\n    int *copy = malloc(size * sizeof(int));\n    memcpy(copy, data, size);\n    // 使用copy...\n    free(copy);\n}",
-    "memcpy的第三个参数是字节数，不是元素个数。正确用法：memcpy(dest, src, count * sizeof(element))。例如复制int数组：memcpy(copy, data, size * sizeof(int))。",
-    "根据参考文档，`memcpy` 的第三个参数是**字节数**，不是元素个数。你的代码 `memcpy(copy, data, size)` 只复制了 `size` 个字节，而非 `size` 个 `int`。\n\n**修复：**\n```c\nmemcpy(copy, data, size * sizeof(int));\n```\n\n**常见错误模式：**\n```c\nmemcpy(dst, src, n);           // 错误：只复制n字节\nmemcpy(dst, src, n * sizeof(*dst));  // 正确：复制n个元素\n```\n\n**最佳实践：** 用 `sizeof(*dst)` 而非 `sizeof(type)`，与目标指针类型绑定，改类型时自动适配。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的引用计数？管理共享资源",
-    None,
-    "引用计数是一种内存管理技术：每个对象维护一个计数器，新引用+1，引用释放-1，计数为0时释放对象。常见于COM对象、智能指针等。关键是要保证计数操作的原子性和成对性。",
-    "根据参考文档，引用计数的核心是**成对的增减操作**：\n\n```c\n#include <stdlib.h>\n\ntypedef struct {\n    int ref_count;\n    void (*destroy)(void *);\n    char data[];\n} RefObject;\n\nRefObject *ref_new(size_t data_size, void (*destroy)(void *)) {\n    RefObject *obj = malloc(sizeof(RefObject) + data_size);\n    obj->ref_count = 1;\n    obj->destroy = destroy;\n    return obj;\n}\n\nRefObject *ref_inc(RefObject *obj) {\n    obj->ref_count++;\n    return obj;\n}\n\nvoid ref_dec(RefObject *obj) {\n    if (--obj->ref_count == 0) {\n        if (obj->destroy) obj->destroy(obj->data);\n        free(obj);\n    }\n}\n```\n\n**规则：** 获取引用时 `ref_inc`，不再使用时 `ref_dec`；创建时计数为1；计数归零时释放。\n\n**注意：** 多线程环境下需用原子操作 `__sync_add_and_fetch`/`__sync_sub_and_fetch`。"
-))
-
-data.append(make_entry(
-    "如何避免头文件重复包含？",
-    None,
-    "C语言使用头文件保护（Include Guard）防止重复包含：#ifndef HEADER_NAME_H / #define HEADER_NAME_H / ... / #endif。部分编译器支持#pragma once，更简洁但非标准。",
-    "根据参考文档，有两种方式：\n\n**1. 传统方式（可移植）：**\n```c\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n\nint my_function(int x);\n\n#endif\n```\n\n**2. #pragma once（简洁但非标准）：**\n```c\n#pragma once\n\nint my_function(int x);\n```\n\n**推荐：** 新项目可用 `#pragma once`，需跨编译器时用传统方式。两者可以同时使用。"
-))
-
-data.append(make_entry(
-    "如何检测和避免内存泄漏？",
-    None,
-    "Valgrind是Linux下最常用的内存检测工具：valgrind --leak-check=full --show-leak-kinds=all ./program。它会报告：definitely lost（确定泄漏）、indirectly lost（间接泄漏）、possibly lost（可能泄漏）、still reachable（仍可达）。AddressSanitizer是编译器内置方案：gcc -fsanitize=address -g program.c。",
-    "根据参考文档，两种主要检测工具：\n\n**1. Valgrind（无需重编译）**\n```bash\nvalgrind --leak-check=full ./program\n```\n输出中关注 `definitely lost`，这是确定的内存泄漏。\n\n**2. AddressSanitizer（编译时注入）**\n```bash\ngcc -fsanitize=address -g program.c -o program\n./program\n```\n运行时检测，发现泄漏会打印详细堆栈。\n\n**防泄漏编码习惯：**\n1. 每写一个 `malloc`，立刻写配对的 `free`\n2. 遵循\"谁分配谁释放\"原则\n3. 用 `goto cleanup` 统一释放多资源\n4. 复杂项目考虑引用计数或内存池"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int *find_max(int arr[], int n) {\n    int max_idx = 0;\n    for (int i = 1; i < n; i++)\n        if (arr[i] > arr[max_idx]) max_idx = i;\n    return &arr[max_idx];\n}",
-    "返回指向函数参数（数组）元素的指针是安全的，因为数组在调用者作用域内有效。但如果传入的是局部数组的指针，则可能产生悬垂指针。更安全的做法是返回索引而非指针。",
-    "这段代码**如果 `arr` 来自调用者作用域则是安全的**，因为返回的指针指向调用者的内存。\n\n但有一个隐患：如果调用者传入局部数组的指针，且该数组在返回后失效，则指针悬垂。\n\n**更安全的做法：返回索引**\n```c\nint find_max_idx(int arr[], int n) {\n    int max_idx = 0;\n    for (int i = 1; i < n; i++)\n        if (arr[i] > arr[max_idx]) max_idx = i;\n    return max_idx;  // 返回索引，调用者用arr[idx]访问\n}\n```\n\n**原则：** 函数应避免返回指向参数内部数据的指针，返回索引更灵活、更安全。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的字符串分割函数？类似strtok但不想修改原字符串",
-    None,
-    "strtok函数会修改原字符串（将分隔符替换为'\\0'），且不是线程安全的。strtok_r是可重入版本。如果不想修改原字符串，需要先复制一份，或自己实现不修改原串的版本。",
-    "根据参考文档，`strtok` 会修改原字符串且非线程安全。以下是不修改原串的实现：\n\n```c\ntypedef struct { const char *start; size_t len; } StrSlice;\n\nint str_split(const char *s, char delim, StrSlice *out, int max_out) {\n    int count = 0;\n    const char *p = s;\n    while (*p && count < max_out) {\n        while (*p == delim) p++;\n        if (!*p) break;\n        const char *start = p;\n        while (*p && *p != delim) p++;\n        out[count].start = start;\n        out[count].len = p - start;\n        count++;\n    }\n    return count;\n}\n\n// 使用\nStrSlice parts[16];\nint n = str_split(\"hello,world,foo\", ',', parts, 16);\nfor (int i = 0; i < n; i++)\n    printf(\"%.*s\\n\", (int)parts[i].len, parts[i].start);\n```\n\n**设计：** 用 `StrSlice` 记录起始位置和长度，不复制字符串；`%.*s` 打印指定长度的子串。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的日志系统？",
-    None,
-    None,
-    "```c\n#include <stdio.h>\n#include <stdarg.h>\n#include <time.h>\n\ntypedef enum { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR } LogLevel;\n\nstatic LogLevel min_level = LOG_INFO;\n\nvoid log_set_level(LogLevel level) { min_level = level; }\n\nvoid log_msg(LogLevel level, const char *file, int line, const char *fmt, ...) {\n    if (level < min_level) return;\n    const char *names[] = {\"DEBUG\", \"INFO\", \"WARN\", \"ERROR\"};\n    time_t now = time(NULL);\n    struct tm *t = localtime(&now);\n    char ts[20];\n    strftime(ts, sizeof(ts), \"%Y-%m-%d %H:%M:%S\", t);\n    fprintf(stderr, \"[%s] [%s] %s:%d: \", ts, names[level], file, line);\n    va_list ap;\n    va_start(ap, fmt);\n    vfprintf(stderr, fmt, ap);\n    va_end(ap);\n    fprintf(stderr, \"\\n\");\n}\n\n#define LOG(level, ...) log_msg(level, __FILE__, __LINE__, __VA_ARGS__)\n```\n\n**使用：** `LOG(LOG_INFO, \"Processing %d items\", count);`\n**输出：** `[2024-01-15 10:30:45] [INFO] main.c:42: Processing 10 items`"
-))
-
-data.append(make_entry(
-    "C语言中指针和数组到底是什么关系？",
-    None,
-    None,
-    "**核心区别：**\n1. 数组是**一块连续内存**，大小在编译时确定（VLA除外）\n2. 指针是**存储地址的变量**，4/8字节\n\n**数组在大多数场景下退化为指针：**\n```c\nint arr[5] = {1,2,3,4,5};\nint *p = arr;       // arr退化为 &arr[0]\narr[i] 等价于 *(arr + i)\n```\n\n**三个不退化的例外：**\n1. `sizeof(arr)` → 返回整个数组大小\n2. `&arr` → 指向数组的指针，类型 `int (*)[5]`\n3. 字符串初始化 `char s[] = \"hello\"`\n\n**关键理解：** `arr[i]` 本质是 `*(arr + i)`，所以 `arr[i]` 和 `i[arr]` 等价（但别这么写）。函数参数中的 `int arr[]` 就是 `int *arr`。"
-))
-
-data.append(make_entry(
-    "如何理解C语言的声明？复杂声明怎么看？",
-    None,
-    None,
-    "**右左法则（Spiral Rule）：** 从变量名开始，先向右看，再向左看，遇到括号换方向。\n\n**示例：**\n```c\nint *arr[10];        // arr是数组[10]，每个元素是int* → 指针数组\nint (*arr)[10];      // arr是指针，指向int[10] → 数组指针\nint *func(void);     // func是函数，返回int* → 返回指针的函数\nint (*func)(void);   // func是指针，指向 返回int的函数 → 函数指针\nint (*arr[5])(int);  // arr是数组[5]，每个元素是函数指针 → 函数指针数组\n```\n\n**技巧：** 用 `typedef` 简化复杂声明\n```c\ntypedef int (*Comparator)(const void *, const void *);\nComparator callbacks[5];  // 比 int (*callbacks[5])(const void*, const void*) 清晰\n```"
-))
-
-data.append(make_entry(
-    "这段代码有什么问题？",
-    "int main(void) {\n    int *ptr;\n    *ptr = 42;\n    printf(\"%d\\n\", *ptr);\n    return 0;\n}",
-    None,
-    "**未初始化指针**（野指针）。`ptr` 没有指向任何有效内存，`*ptr = 42` 向随机地址写入，未定义行为。\n\n**修复：**\n```c\nint value;\nint *ptr = &value;  // 指向有效变量\n*ptr = 42;\nprintf(\"%d\\n\", *ptr);  // 输出42\n```\n\n或动态分配：\n```c\nint *ptr = malloc(sizeof(int));\nif (!ptr) return 1;\n*ptr = 42;\nprintf(\"%d\\n\", *ptr);\nfree(ptr);\n```\n\n**规则：** 指针声明后必须初始化——要么指向有效变量，要么指向 `malloc` 返回的内存，要么设为 `NULL`。"
-))
-
-data.append(make_entry(
-    "C语言中如何实现泛型编程？",
-    None,
-    None,
-    "C语言通过 `void*` + 函数指针 + 元素大小实现泛型：\n\n**1. 泛型容器**\n```c\ntypedef struct { void *data; size_t size; size_t elem_size; size_t capacity; } GenericVec;\n```\n\n**2. 泛型算法（如qsort）**\n```c\nvoid my_sort(void *base, size_t n, size_t elem_size,\n             int (*cmp)(const void *, const void *));\n```\n\n**3. 泛型宏（C11 _Generic）**\n```c\n#define print_val(x) _Generic((x), \\\n    int: printf(\"%d\\n\", x), \\\n    double: printf(\"%f\\n\", x), \\\n    char*: printf(\"%s\\n\", x))\n```\n\n**局限：** `void*` 丢失类型信息，需调用者保证类型正确；没有模板那样的编译期检查；调试困难。\n\n**实际项目：** 标准库的 `qsort`/`bsearch` 是最好的泛型范例。"
-))
-
-data.append(make_entry(
-    "如何实现一个简单的配置文件解析器？",
-    None,
-    "常见的配置文件格式为 key=value，每行一个配置项。#开头的行为注释。解析时需要：跳过空行和注释行、去除key和value两端的空白字符、处理等号分隔。建议使用fgets逐行读取，strtok或手动解析key/value。",
-    "根据参考文档，实现一个简单的 key=value 配置解析器：\n\n```c\n#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n#include <ctype.h>\n\ntypedef struct { char key[64]; char value[256]; } ConfigEntry;\n\nstatic char *trim(char *s) {\n    while (isspace(*s)) s++;\n    char *end = s + strlen(s) - 1;\n    while (end > s && isspace(*end)) *end-- = '\\0';\n    return s;\n}\n\nint parse_config(const char *path, ConfigEntry *entries, int max) {\n    FILE *fp = fopen(path, \"r\");\n    if (!fp) return -1;\n    int count = 0;\n    char line[512];\n    while (fgets(line, sizeof(line), fp) && count < max) {\n        char *p = trim(line);\n        if (*p == '#' || *p == '\\0') continue;\n        char *eq = strchr(p, '=');\n        if (!eq) continue;\n        *eq = '\\0';\n        strncpy(entries[count].key, trim(p), 63);\n        strncpy(entries[count].value, trim(eq + 1), 255);\n        count++;\n    }\n    fclose(fp);\n    return count;\n}\n```\n\n**支持格式：** `key = value`、`#注释`、自动去除空白。"
-))
-
-with open("fine_tune_train_set_c_programming.json", "w", encoding="utf-8") as f:
+data.append(make_entry('我的程序运行时出现了段错误（Segmentation Fault），请帮我分析原因', 'void swap(int *a, int *b) {\n    int *temp;\n    *temp = *a;\n    *a = *b;\n    *b = *temp;\n}\n\nint main(void) {\n    int x = 3, y = 5;\n    swap(&x, &y);\n    printf("x=%d, y=%d\\n", x, y);\n    return 0;\n}', None, None, '问题出在 `swap` 函数中的 `int *temp;`。你声明了一个指针但没有让它指向任何有效内存——它是**未初始化的野指针**。`*temp = *a;` 试图向未知地址写入数据，触发段错误。\n\n**修复：** 将 `temp` 改为普通整型变量：\n```c\nvoid swap(int *a, int *b) {\n    int temp;\n    temp = *a;\n    *a = *b;\n    *b = temp;\n}\n```\n\n**要点：**\n1. 指针必须指向有效内存后才能解引用（`*ptr`），未初始化指针是C语言最常见的崩溃来源\n2. 这里只需临时保存一个整数值，普通 `int temp` 就够了\n3. 调试段错误的思路：检查所有指针操作——是否初始化？是否指向已释放内存？是否越界？'))
+data.append(make_entry('这段代码运行结果不稳定，有时正确有时崩溃', 'char *get_greeting(void) {\n    char msg[64];\n    strcpy(msg, "Hello, World!");\n    return msg;\n}', None, None, '这是经典的**返回局部变量地址**错误。`msg` 是栈上的局部数组，函数返回后栈帧被回收，返回的指针变成**悬垂指针**，访问它是未定义行为。\n\n**推荐修复：调用者提供缓冲区**\n```c\nvoid get_greeting(char *buf, size_t size) {\n    snprintf(buf, size, "Hello, World!");\n}\n\nint main(void) {\n    char greeting[64];\n    get_greeting(greeting, sizeof(greeting));\n    printf("%s\\n", greeting);\n    return 0;\n}\n```\n内存的分配和释放在同一层，权责清晰。\n\n**核心原则：** 谁分配谁释放。'))
+data.append(make_entry('我的程序长时间运行后内存占用越来越大，怀疑有内存泄漏', 'void remove_first(struct Node *head) {\n    if (head->next == NULL) return;\n    struct Node *to_remove = head->next;\n    head->next = to_remove->next;\n}', None, None, '问题在 `remove_first` 中：你把节点从链表摘除了，但**没有 `free()` 释放内存**。每次删除都泄漏 `sizeof(struct Node)` 字节。\n\n**修复：**\n```c\nvoid remove_first(struct Node *head) {\n    if (head->next == NULL) return;\n    struct Node *to_remove = head->next;\n    head->next = to_remove->next;\n    free(to_remove);\n}\n```\n\n**排查工具：**\n- Valgrind：`valgrind --leak-check=full ./program`\n- AddressSanitizer：`gcc -fsanitize=address -g program.c`\n\n**防泄漏习惯：** 每写一个 `malloc`，立刻写配对的 `free`，再填充中间逻辑。'))
+data.append(make_entry("编译警告 implicit declaration of function 'strlen'，运行结果也不对", '#include <stdio.h>\n\nint main(void) {\n    char name[] = "Hello";\n    int len = strlen(name);\n    printf("Length: %d\\n", len);\n    return 0;\n}', None, None, '缺少头文件 `#include <string.h>`。`strlen` 的声明在 `<string.h>` 中，没有它编译器假设返回 `int`，但实际返回 `size_t`，64位系统上截断后结果错误。\n\n**修复：**\n```c\n#include <stdio.h>\n#include <string.h>\n\nint main(void) {\n    char name[] = "Hello";\n    size_t len = strlen(name);\n    printf("Length: %zu\\n", len);\n    return 0;\n}\n```\n\n**要点：** 不要忽略编译器警告，建议加 `-Wall -Wextra`。用 `size_t` 接收 `strlen` 返回值，用 `%zu` 打印。'))
+data.append(make_entry('我的if判断总是走错分支', 'int a = 3;\nif (a = 5) {\n    printf("a is 5\\n");\n} else {\n    printf("a is not 5\\n");\n}', None, None, '把 `==`（比较）写成了 `=`（赋值）。`a = 5` 是赋值，表达式值为5（非零即真），条件永远为真。\n\n**修复：** `if (a == 5)`\n\n**防止方法：**\n1. 常量放左边：`if (5 == a)`，少写 `=` 会编译报错\n2. 开启 `-Wall` 警告'))
+data.append(make_entry('strcpy运行时崩溃了', 'char *src = "Hello, World!";\nchar *dst;\nstrcpy(dst, src);', None, None, '`dst` 是未初始化的指针，没有指向有效内存。`strcpy` 向未知地址写入，崩溃。\n\n**修复：**\n```c\nchar src[] = "Hello, World!";\nchar dst[64];\nstrcpy(dst, src);\n```\n\n或动态分配：\n```c\nchar *dst = malloc(strlen(src) + 1);\nif (dst) { strcpy(dst, src); free(dst); }\n```\n\n**核心原则：** 字符串操作前必须确保目标有足够内存。'))
+data.append(make_entry('函数调用后指针没有变化，为什么？', 'void alloc_buffer(char *ptr, int size) {\n    ptr = malloc(size);\n}\n\nint main(void) {\n    char *buf = NULL;\n    alloc_buffer(buf, 1024);\n    // buf 仍然是 NULL\n}', None, None, 'C语言函数参数是**值传递**。`ptr` 是 `buf` 的拷贝，`ptr = malloc(size)` 只修改了拷贝，对原始 `buf` 无影响。\n\n**修复：传递指针的指针**\n```c\nvoid alloc_buffer(char **ptr, int size) {\n    *ptr = malloc(size);\n}\n\nint main(void) {\n    char *buf = NULL;\n    alloc_buffer(&buf, 1024);\n    if (buf) { free(buf); }\n}\n```\n\n**理解要点：** 要在函数内修改外部变量，必须传其地址。修改 `int` → 传 `int *`；修改 `char *` → 传 `char **`。'))
+data.append(make_entry('5/9为什么等于0？', 'int a = 5, b = 9;\ndouble result = a / b;\n// result 是 0.0，不是 0.555...', None, None, 'C语言整数除法规则：**两个整数相除，结果还是整数，小数部分截断**。5/9 = 0，再赋给 `double` 变成 0.0。\n\n**修复：在除法前转换至少一个操作数**\n```c\ndouble result = (double)a / b;  // 5.0 / 9 = 0.555...\n```\n\n**注意：** `(double)(a / b)` 不行——先整数除法得0，再转double还是0.0。必须在除法**之前**转换。'))
+data.append(make_entry("链接时报错 undefined reference to 'sqrt'，但我已经包含了math.h", '#include <stdio.h>\n#include <math.h>\nint main(void) {\n    printf("sqrt(2) = %f\\n", sqrt(2.0));\n    return 0;\n}', None, None, '`#include <math.h>` 只提供了声明，`sqrt` 的实现在数学库 `libm` 中，GCC默认不链接。\n\n**修复：编译时加 `-lm`**\n```bash\ngcc program.c -o program -lm\n```\n\n**注意：** `-lm` 要放在源文件后面，因为链接器从左到右处理。常见需手动链接的库：`-lm`（数学）、`-lpthread`（线程）、`-lrt`（实时）。'))
+data.append(make_entry('我的二分查找总是返回-1', 'int binary_search(int arr[], int n, int target) {\n    int left = 0, right = n;\n    while (left < right) {\n        int mid = (left + right) / 2;\n        if (arr[mid] == target) return mid;\n        else if (arr[mid] < target) left = mid;\n        else right = mid;\n    }\n    return -1;\n}', None, None, '有两个bug：\n1. **区间定义不一致**：`right = n` 是右开区间，但 `left = mid` 按闭区间逻辑写\n2. **死循环**：当 `left + 1 == right` 时，`mid = left`，`left = mid` 不变\n\n**修复：统一左闭右开区间**\n```c\nint binary_search(int arr[], int n, int target) {\n    int left = 0, right = n;\n    while (left < right) {\n        int mid = left + (right - left) / 2;\n        if (arr[mid] == target) return mid;\n        else if (arr[mid] < target) left = mid + 1;\n        else right = mid;\n    }\n    return -1;\n}\n```\n\n**调试方法：** 在循环内加 `printf("left=%d, right=%d, mid=%d\\n", left, right, mid);` 观察变量变化。'))
+data.append(make_entry('程序输出了很大的负数或4294967295这种奇怪数字', None, None, None, '常见原因：\n1. **整数溢出**：`int a = 2000000000; int b = a + a;` → 负数。修复：用 `long long`\n2. **无符号下溢**：`unsigned int x = 5; unsigned int z = x - 10;` → 4294967291\n3. **格式符不匹配**：`long n; printf("%d", n);` → 64位系统只打印低32位\n4. **未初始化变量**：`int x; printf("%d", x);` → 栈上随机垃圾值\n5. **数组越界读取**：读到栈上其他数据\n\n**快速诊断：** 大负数→int溢出；4294967295→unsigned下溢；随机大数→未初始化或越界'))
+data.append(make_entry('sizeof(arr)在函数内外结果不同，为什么？', 'int arr[10];\nprintf("%zu\\n", sizeof(arr));   // 40\n\nvoid foo(int arr[]) {\n    printf("%zu\\n", sizeof(arr));  // 8\n}', None, None, '数组在大多数表达式中会**退化为指向首元素的指针**，但 `sizeof` 是例外——在定义处返回整个数组大小。\n\n函数参数 `int arr[]` 只是 `int *arr` 的语法糖，传参时退化，所以 `sizeof(arr)` 是指针大小（64位系统8字节）。\n\n**影响：** 函数内不能用 `sizeof(arr)/sizeof(arr[0])` 计算元素个数，必须额外传入长度。\n\n**三个不退化的例外：** `sizeof(arr)`、`&arr`、字符串初始化 `char s[] = "hello"`'))
+data.append(make_entry('我的scanf读取字符串后，下一个输入被跳过了', 'int age;\nchar name[32];\nscanf("%d", &age);\nscanf("%s", name);', None, None, '`scanf("%d")` 读取数字后，换行符 `\\n` 留在缓冲区，下一个 `scanf("%s")` 可能读到残留字符。\n\n**修复1：格式字符串加空格**\n```c\nscanf("%d", &age);\nscanf(" %31s", name);  // %前加空格跳过空白\n```\n\n**修复2（推荐）：用fgets+sscanf**\n```c\nchar line[256];\nfgets(line, sizeof(line), stdin);\nsscanf(line, "%d", &age);\nfgets(line, sizeof(line), stdin);\nline[strcspn(line, "\\n")] = \'\\0\';\n```\n\n**scanf安全清单：** 字符串指定宽度 `%31s`；`%d` 前加空格；检查返回值；混合输入优先用 `fgets`+`sscanf`；永远不用 `gets()`'))
+data.append(make_entry('文件读取时多读了一行', 'FILE *fp = fopen(filename, "r");\nchar line[256];\nwhile (!feof(fp)) {\n    fgets(line, sizeof(line), fp);\n    printf("%s", line);\n}\nfclose(fp);', None, None, '`feof(fp)` 只有在**读取操作遇到EOF之后**才返回真，所以循环会多执行一次。\n\n**修复：用fgets返回值控制循环**\n```c\nFILE *fp = fopen(filename, "r");\nif (!fp) { perror("fopen"); return; }\nchar line[256];\nwhile (fgets(line, sizeof(line), fp) != NULL) {\n    printf("%s", line);\n}\nfclose(fp);\n```\n\n**文件操作要点：** `fopen` 后检查返回值；用 `fgets` 返回值控制循环，不用 `feof`；二进制文件用 `"rb"`/`"wb"`。'))
+data.append(make_entry('这段代码拼接字符串后输出乱码', 'char *concat(const char *a, const char *b) {\n    char result[256];\n    sprintf(result, "%s%s", a, b);\n    return result;\n}', None, None, '返回局部数组地址——`result` 在栈上，函数返回后内存被回收，悬垂指针导致乱码。\n\n**推荐修复：调用者提供缓冲区**\n```c\nvoid concat(char *out, size_t out_size, const char *a, const char *b) {\n    snprintf(out, out_size, "%s%s", a, b);\n}\n```\n\n**通用规则：** 局部数组地址绝不能作为返回值；字符串操作函数的标准模式是调用者传入缓冲区和大小；用 `snprintf` 而非 `sprintf`。'))
+data.append(make_entry('这段代码有什么问题？', 'char *s = "hello";\ns[0] = \'H\';\nprintf("%s\\n", s);', None, None, '**未定义行为**，可能崩溃。`"hello"` 是字符串字面量，存储在只读数据区，`s[0] = \'H\'` 试图修改只读内存。\n\n**修复：用数组**\n```c\nchar s[] = "hello";  // 栈上数组，可修改\ns[0] = \'H\';\nprintf("%s\\n", s);  // 输出 Hello\n```\n\n**区别：**\n```c\nchar *s = "hello";   // 指向只读字面量，不可修改\nchar s[] = "hello";  // 栈上数组，可修改\n```\n\n**最佳实践：** 指向字符串字面量的指针声明为 `const char *`：`const char *s = "hello";`'))
+data.append(make_entry('这段代码有什么问题？', 'int arr[5];\nfor (int i = 0; i <= 5; i++) {\n    arr[i] = i * 2;\n}', None, None, '**Off-by-one 错误**：`i <= 5` 应该是 `i < 5`。当 `i=5` 时，`arr[5]` 越界（有效索引0-4）。\n\n**修复：** `for (int i = 0; i < 5; i++)`\n\n**防越界习惯：**\n1. 用 `#define SIZE 5`，循环用 `i < SIZE`\n2. 用 `sizeof(arr)/sizeof(arr[0])` 计算数组长度\n3. 开启 `-fsanitize=address` 检测越界\n\n**Off-by-one 是最常见的bug之一**，特别注意 `<=` 和 `<` 的选择。半开区间 `[0, n)` 是C语言的标准惯例。'))
+data.append(make_entry('这段代码有什么问题？', 'if (sizeof(int) > -1) {\n    printf("int is bigger\\n");\n} else {\n    printf("-1 is bigger\\n");\n}', None, None, '输出 `-1 is bigger`。`sizeof` 返回 `size_t`（`unsigned`），`-1` 被隐式转为 `unsigned` 变成 `4294967295`，比4大。\n\n**规则：** 当 `signed` 和 `unsigned` 比较时，`signed` 被转为 `unsigned`，负数变成很大的正数。\n\n**修复：** `if ((int)sizeof(int) > -1)`\n\n**避免signed/unsigned混用：** 循环变量与 `size_t` 比较时也用 `size_t`；不要用 `int` 与 `strlen`/`sizeof` 直接比较；编译加 `-Wsign-compare`。'))
+data.append(make_entry('这段代码有什么问题？', 'int *p = malloc(sizeof(int));\n*p = 42;\nfree(p);\nprintf("%d\\n", *p);', None, None, '**Use-After-Free**：`free(p)` 后访问 `*p` 是未定义行为。\n\n**修复：** `free` 后将指针置NULL\n```c\nfree(p);\np = NULL;\n```\n\n后续访问 `p` 会段错误而非读到脏数据，更容易调试。\n\n**相关陷阱：** Double Free（对同一指针 `free` 两次）也会崩溃或破坏堆。\n\n**检测工具：** `gcc -fsanitize=address` 可检测 Use-After-Free 和 Double Free。'))
+data.append(make_entry('这段代码有什么问题？', 'char buf[8];\nscanf("%s", buf);', None, None, '**缓冲区溢出**。`scanf("%s")` 不限制读取长度，输入超过7个字符就溢出。\n\n**修复：**\n```c\nchar buf[8];\nscanf("%7s", buf);  // 最多读7字符 + \'\\0\'\n```\n\n**更安全：**\n```c\nchar buf[8];\nfgets(buf, sizeof(buf), stdin);\nbuf[strcspn(buf, "\\n")] = \'\\0\';\n```\n\n**安全编码原则：** 永远不要用不带长度限制的字符串输入函数（`scanf("%s")`、`gets()`、`strcpy`）。'))
+data.append(make_entry('这段代码有什么问题？', 'int *create_array(int size) {\n    int arr[size];\n    for (int i = 0; i < size; i++) arr[i] = 0;\n    return arr;\n}', None, None, '两个问题：\n1. **返回局部数组地址**：`arr` 在栈上，函数返回后内存失效\n2. **VLA隐患**：`int arr[size]` 是变长数组，`size` 很大时可能栈溢出\n\n**修复：**\n```c\nint *create_array(int size) {\n    int *arr = calloc(size, sizeof(int));  // 自动清零\n    return arr;\n}\n```\n\n**VLA注意：** C99支持，C11变为可选；大尺寸VLA可能导致栈溢出；生产代码中慎用。'))
+data.append(make_entry('这段代码有什么问题？', 'int *arr = malloc(n * sizeof(int));\narr[0] = 42;', None, None, '没有检查 `malloc` 返回值。内存不足时 `malloc` 返回 `NULL`，`arr[0] = 42` 会导致段错误。\n\n**修复：**\n```c\nint *arr = malloc(n * sizeof(int));\nif (arr == NULL) {\n    fprintf(stderr, "malloc failed\\n");\n    exit(EXIT_FAILURE);\n}\narr[0] = 42;\n```\n\n**最佳实践：** 每次 `malloc`/`calloc`/`realloc` 后都检查返回值。可封装安全分配函数：\n```c\nvoid *safe_malloc(size_t size) {\n    void *p = malloc(size);\n    if (!p) { fprintf(stderr, "malloc(%zu) failed\\n", size); exit(1); }\n    return p;\n}\n```'))
+data.append(make_entry('#define宏有哪些常见坑？', '#define SQUARE(x) x * x\nint r = SQUARE(2 + 3);', None, None, '`SQUARE(2 + 3)` 展开为 `2 + 3 * 2 + 3 = 11`，不是25。\n\n**修复：** `#define SQUARE(x) ((x) * (x))`\n\n**另一个坑：参数有副作用**\n```c\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\nMAX(x++, y++);  // x++ 或 y++ 可能执行两次\n```\n修复：用 `inline` 函数\n```c\nstatic inline int max(int a, int b) { return a > b ? a : b; }\n```\n\n**宏的替代方案：** 常量→`const`/`enum`；带参数宏→`inline`函数；类型别名→`typedef`。何时仍需宏：条件编译、泛型代码。'))
+data.append(make_entry("这段代码编译报错 conflicting types for 'foo'，但我只定义了一次", '#include <stdio.h>\nint main(void) {\n    int result = foo(3);\n    printf("%d\\n", result);\n    return 0;\n}\ndouble foo(int x) {\n    return x * 2.5;\n}', None, None, '编译器遇到 `foo(3)` 时 `foo` 还没声明，会隐式假设返回 `int`。后面实际定义返回 `double`，类型冲突。\n\n**修复：在使用前声明函数**\n```c\ndouble foo(int x);  // 前向声明\n\nint main(void) {\n    int result = foo(3);\n    printf("%d\\n", result);\n    return 0;\n}\n\ndouble foo(int x) {\n    return x * 2.5;\n}\n```\n\n**最佳实践：** 每个函数在头文件中声明，使用前 `#include`，不依赖定义顺序。C99已禁止隐式声明，建议用 `-std=c11 -Wall`。'))
+data.append(make_entry('这段代码有什么问题？', 'for (int i = 0; i < n; i++) {\n    int *p = malloc(sizeof(int));\n    *p = i;\n}\n// 循环结束后无法访问任何分配的内存', None, None, '两个问题：\n1. **内存泄漏**：每次 `malloc` 分配内存，但 `p` 在下次迭代被覆盖\n2. **无法访问**：循环结束后所有分配的内存都丢失了\n\n**更好的方案：直接用连续内存**\n```c\nint *arr = malloc(n * sizeof(int));\nfor (int i = 0; i < n; i++) arr[i] = i;\n// 使用...\nfree(arr);\n```\n\n一次 `malloc` + 一次 `free`，简单高效。每个 `int` 单独 `malloc` 既浪费内存又影响缓存性能。'))
+data.append(make_entry('字符串拼接为什么很慢？如何优化？', 'char buf[1024] = "";\nstrcat(buf, "Hello, ");\nstrcat(buf, name);\nstrcat(buf, "! ");\nstrcat(buf, message);', None, None, '每次 `strcat` 都从头扫描找 `\\0`，O(n²)——**Schlemiel the Painter 问题**。\n\n**优化：追踪末尾位置**\n```c\nchar buf[1024];\nsize_t pos = 0;\npos += snprintf(buf + pos, sizeof(buf) - pos, "Hello, ");\npos += snprintf(buf + pos, sizeof(buf) - pos, "%s", name);\npos += snprintf(buf + pos, sizeof(buf) - pos, "! ");\npos += snprintf(buf + pos, sizeof(buf) - pos, "%s", message);\n```\n\n每次追加直接在末尾写入，O(n)。其他优化：缓存 `strlen` 结果；已知长度用 `memcpy`；批量操作用 `memset`/`memcmp`。'))
+data.append(make_entry('这段代码有什么问题？', 'int *p = malloc(sizeof(int));\n*p = 42;\n// 使用p...\n// 忘记free(p)', None, None, '**内存泄漏**：`malloc` 分配的内存没有 `free`，程序运行期间这块内存一直被占用。\n\n**修复：**\n```c\nint *p = malloc(sizeof(int));\nif (!p) return;\n*p = 42;\n// 使用p...\nfree(p);\np = NULL;\n```\n\n**防泄漏习惯：**\n1. 每写一个 `malloc`，立刻写配对的 `free`，再填充中间逻辑\n2. 遵循"谁分配谁释放"原则\n3. 用 Valgrind 或 AddressSanitizer 检测泄漏'))
+data.append(make_entry('我的程序崩溃了，提示double free or corruption', 'void process(void) {\n    char *buf = malloc(256);\n    // 使用buf...\n    free(buf);\n    // 很多代码后...\n    free(buf);  // 又free了一次\n}', None, None, '**Double Free**：对同一块内存 `free` 两次，破坏堆的数据结构，导致崩溃或未定义行为。\n\n**修复：free后置NULL**\n```c\nchar *buf = malloc(256);\nif (!buf) return;\n// 使用buf...\nfree(buf);\nbuf = NULL;  // 防止再次free\n```\n\n`free(NULL)` 是安全的（什么都不做），所以置NULL后再free不会出错。\n\n**更根本的解决：** 遵循"谁分配谁释放"原则，让分配和释放在同一抽象层。'))
+data.append(make_entry('printf输出乱码，而且程序行为很奇怪', 'char name[32];\nprintf("Enter name: ");\nscanf("%s", name);\nprintf("Hello %s\\n", name);', None, 'printf函数的第一个参数是格式字符串，如果用户输入包含%符号，printf会将其解释为格式说明符，导致读取栈上随机数据甚至崩溃。\n\n**安全做法：** 永远不要将用户输入直接作为printf的第一个参数。\n```c\nprintf("%s", name);  // 正确：用%s格式化\n```\n\n**格式化字符串漏洞是严重的安全问题**，攻击者可通过精心构造的输入读取内存或执行任意代码。', '根据参考文档，这是**格式化字符串漏洞**。`printf(name)` 将用户输入当作格式字符串，如果 `name` 包含 `%s`、`%x`、`%n` 等格式说明符，`printf` 会读取栈上数据甚至写入内存。\n\n**修复：**\n```c\nprintf("%s\\n", name);  // 正确：用%s格式化用户输入\n```\n\n**安全原则：** 永远不要将用户输入直接作为 `printf` 的第一个参数。同理，`fprintf`、`sprintf`、`syslog` 等也要注意。'))
+data.append(make_entry('switch语句执行了不该执行的case', 'int x = 2;\nswitch (x) {\n    case 1: printf("one\\n");\n    case 2: printf("two\\n");\n    case 3: printf("three\\n");\n}', None, None, '**缺少 `break`**，导致fall-through。输出 `two\\nthree\\n` 而非仅 `two\\n`。\n\n**修复：**\n```c\nswitch (x) {\n    case 1: printf("one\\n"); break;\n    case 2: printf("two\\n"); break;\n    case 3: printf("three\\n"); break;\n}\n```\n\n**注意：** GCC/Clang 加 `-Wimplicit-fallthrough` 会警告缺少break。如果确实需要fall-through，加注释 `/* fall through */`。'))
+data.append(make_entry('这段代码有什么问题？', 'int i = 0;\nwhile (i < 10);\n{\n    printf("%d\\n", i);\n    i++;\n}', None, None, '`while (i < 10)` 后面多了分号，变成**空循环体**，`i` 永远不变，死循环。\n\n**修复：** 删除分号\n```c\nint i = 0;\nwhile (i < 10)\n{\n    printf("%d\\n", i);\n    i++;\n}\n```\n\n**类似陷阱：** `if (x > 0);` 后加分号也会导致条件体为空。建议 `while`/`if` 后的大括号写在同一行，减少此类错误。'))
+data.append(make_entry('malloc分配的内存不够，字符串操作后崩溃', 'char *copy_str(const char *s) {\n    char *copy = malloc(strlen(s));\n    strcpy(copy, s);\n    return copy;\n}', None, None, '**Off-by-one**：`strlen` 不计 `\\0`，但 `strcpy` 会复制包括 `\\0` 在内的所有字符，多写1字节。\n\n**修复：** `malloc(strlen(s) + 1)`\n\n**更安全的写法：**\n```c\nchar *copy_str(const char *s) {\n    size_t len = strlen(s);\n    char *copy = malloc(len + 1);\n    if (!copy) return NULL;\n    memcpy(copy, s, len + 1);\n    return copy;\n}\n```\n\n**字符串分配公式：** `malloc(strlen(s) + 1)`，+1给 `\\0`。'))
+data.append(make_entry('用==比较两个字符串是否相等，但结果不对', 'char s1[] = "hello";\nchar s2[] = "hello";\nif (s1 == s2) {\n    printf("equal\\n");\n} else {\n    printf("not equal\\n");  // 总是走这里\n}', None, None, '`s1 == s2` 比较的是**指针地址**，不是字符串内容。两个不同数组地址不同。\n\n**修复：用strcmp**\n```c\nif (strcmp(s1, s2) == 0) {\n    printf("equal\\n");\n}\n```\n\n**规则：** C语言中字符串比较必须用 `strcmp`/`strncmp`；`==` 只在比较指针是否指向同一地址时使用。'))
+data.append(make_entry('scanf读取整数时程序崩溃了', 'int x;\nscanf("%d", x);  // 缺少&', None, None, '`scanf` 需要变量的**地址**来写入值。`scanf("%d", x)` 把 `x` 的值当地址传入，向随机地址写入，崩溃。\n\n**修复：** `scanf("%d", &x);`\n\n**例外：** 数组名和字符串不需要 `&`，因为它们本身就是地址：\n```c\nchar name[32];\nscanf("%31s", name);  // name已经是地址，不需要&\n```'))
+data.append(make_entry('递归函数导致栈溢出，程序崩溃', 'int factorial(int n) {\n    return n * factorial(n - 1);\n}', None, None, '**缺少递归终止条件**（base case），无限递归直到栈溢出。\n\n**修复：**\n```c\nint factorial(int n) {\n    if (n <= 1) return 1;  // 终止条件\n    return n * factorial(n - 1);\n}\n```\n\n**递归三要素：** 终止条件、递归调用、问题规模缩小。写递归时先写终止条件。'))
+data.append(make_entry('这段代码有什么问题？', 'int *arr = malloc(n * sizeof(int));\n// 使用arr...\nfree(arr);\narr[0] = 10;  // 还在使用', None, None, '**Use-After-Free**：`free(arr)` 后访问 `arr[0]` 是未定义行为，可能崩溃、读到脏数据、或看似正常。\n\n**修复：** free后置NULL\n```c\nfree(arr);\narr = NULL;\n```\n\n后续访问会段错误而非读到脏数据，更容易发现bug。\n\n**检测：** `gcc -fsanitize=address -g program.c && ./a.out`'))
+data.append(make_entry('struct的内存对齐规则是什么？sizeof结果比预期大', 'struct A {\n    char c;\n    int i;\n    char d;\n};\n// sizeof = 12，不是6', None, None, '编译器在成员间插入填充字节（padding），使每个成员对齐到其大小的倍数。\n\n**你的例子：** `char c`(1字节) + 填充3字节 + `int i`(4字节) + `char d`(1字节) + 填充3字节 = 12\n\n**优化：按对齐从大到小排列**\n```c\nstruct Good {\n    int i;     // 4字节\n    char c;    // 1字节\n    char d;    // 1字节\n               // 填充2字节\n};  // sizeof = 8\n```\n\n**规则：** 每个成员偏移量必须是其对齐要求的整数倍；结构体总大小必须是最大对齐要求的整数倍。'))
+data.append(make_entry('这段代码有什么问题？', 'printf("%d\\n", 3.14);\nprintf("%f\\n", 42);', None, None, '**格式说明符与类型不匹配**，输出垃圾值或崩溃。\n\n**正确用法：**\n```c\nprintf("%f\\n", 3.14);   // double用%f\nprintf("%d\\n", 42);     // int用%d\nprintf("%ld\\n", 42L);   // long用%ld\nprintf("%lld\\n", 42LL); // long long用%lld\nprintf("%zu\\n", n);     // size_t用%zu\n```\n\n**常见错误：** `long` 用 `%d`（64位系统截断）；`size_t` 用 `%d`；`double` 用 `%d`。编译加 `-Wformat` 可检测。'))
+data.append(make_entry('Release模式崩溃但Debug正常，可能是什么原因？', None, None, None, '几乎总是**未定义行为（UB）**——Debug碰巧正确，优化器改变了行为。\n\n**最常见原因：**\n1. **未初始化变量**：Debug栈内存可能恰好为0，Release是随机值\n2. **数组越界**：Debug越界写入可能覆盖不重要的内存\n3. **Use-After-Free**：`free(p); printf("%s", p);` Debug下可能"正常"\n4. **有符号整数溢出**：优化器可能假设不会溢出\n5. **严格别名违规**：`int bits = *(int *)&f;` 应用 `memcpy`\n\n**调试：** `gcc -fsanitize=address,undefined -g program.c`\n\n**核心原则：** 依赖UB的代码是定时炸弹，必须严格遵守标准。'))
+data.append(make_entry('如何正确实现二维动态数组？', 'int **m = malloc(rows * sizeof(int *));\nfor (int i = 0; i < rows; i++)\n    m[i] = malloc(cols * sizeof(int));', None, None, '你的写法可以但不够高效（每行单独malloc，内存不连续）。\n\n**推荐：一次分配 + 指针数组**\n```c\nint **create_matrix(int rows, int cols) {\n    int **m = malloc(rows * sizeof(int *));\n    int *data = malloc(rows * cols * sizeof(int));\n    for (int i = 0; i < rows; i++)\n        m[i] = data + i * cols;\n    return m;\n}\n\nvoid free_matrix(int **m) {\n    free(m[0]);  // 释放数据区\n    free(m);     // 释放指针数组\n}\n```\n\n**优点：** 数据连续（缓存友好），只需2次malloc，仍可用 `m[i][j]`。'))
+data.append(make_entry('malloc、calloc、realloc有什么区别？realloc有什么坑？', None, None, None, '| 函数 | 初始化 | 用途 |\n|------|--------|------|\n| `malloc(size)` | 否 | 通用分配 |\n| `calloc(n, size)` | 清零 | 需要0初始化 |\n| `realloc(ptr, size)` | 新增部分不初始化 | 扩容/缩容 |\n\n**realloc的坑：**\n1. **不能直接用原指针接收**：`ptr = realloc(ptr, n)` 失败时原指针丢失。正确：用临时指针接收，检查后再赋值\n2. **可能移动内存**：返回新地址时，旧地址失效\n3. **realloc(NULL, size) 等价于 malloc(size)**\n\n**最佳实践：** 用 `sizeof(*ptr)` 代替 `sizeof(type)`：`int *arr = malloc(10 * sizeof(*arr));`'))
+data.append(make_entry('C语言中static关键字有哪些用法？', None, None, None, '`static` 有三种不同用法：\n\n**1. 静态局部变量（函数内）**：只初始化一次，值在调用间保持\n```c\nvoid counter(void) { static int count = 0; count++; }\n```\n\n**2. 静态全局变量（函数外）**：只在当前.c文件可见\n```c\nstatic int module_state = 0;\n```\n\n**3. 静态函数**：只在当前.c文件可见\n```c\nstatic int helper(int x) { ... }\n```\n\n**核心记忆：** 函数内延长生命周期，函数外限制可见性。**最佳实践：** 不需要对外暴露的函数和全局变量都应加 `static`。'))
+data.append(make_entry('C语言有哪些好的编码规范？', None, None, None, '**1. 命名规范**：变量/函数用小写+下划线 `student_count`；宏用全大写 `MAX_SIZE`；类型首字母大写 `Vec`\n\n**2. 函数只做一件事**，控制在30行以内\n\n**3. 防御性编程**：`if (!buf) { fprintf(stderr, "OOM\\n"); exit(1); }`\n\n**4. const修饰不应修改的参数**：`int sum(const int *arr, int n);`\n\n**5. 谁分配谁释放**，分配和释放在同一层\n\n**6. 头文件保护**：`#ifndef UTILS_H / #define UTILS_H / #endif`\n\n**7. 编译选项**：`gcc -Wall -Wextra -Werror -std=c11 -g program.c`\n\n**8. 用 `sizeof(*ptr)` 代替 `sizeof(type)`**：`int *arr = malloc(10 * sizeof(*arr));`\n\n**9. static修饰不需要对外暴露的函数和全局变量**'))
+data.append(make_entry('如何组织多文件项目？经常遇到重复定义和未定义引用', None, None, None, '**核心原则：头文件放声明，源文件放定义。**\n\n```\nproject/\n├── main.c\n├── math_utils.h    ← 声明\n├── math_utils.c    ← 实现\n└── Makefile\n```\n\n**math_utils.h：**\n```c\n#ifndef MATH_UTILS_H\n#define MATH_UTILS_H\nint max(int a, int b);\n#endif\n```\n\n**常见链接错误：**\n1. "multiple definition" → .h中放了定义，应只放 `extern` 声明\n2. "undefined reference" → Makefile缺少 .o 文件\n3. "redefinition" → 缺少头文件保护\n\n**static的妙用：** 不对外暴露的函数和全局变量加 `static`，避免命名冲突。'))
+data.append(make_entry('C语言中如何处理错误？有什么好的错误处理模式？', None, None, None, 'C语言没有异常机制，常见模式：\n\n**1. 返回值表示错误**\n```c\nint divide(int a, int b, int *result) {\n    if (b == 0) return -1;\n    *result = a / b;\n    return 0;\n}\n```\n\n**2. errno机制**\n```c\nFILE *fp = fopen("config.txt", "r");\nif (!fp) { perror("fopen"); }\n```\n\n**3. goto清理模式（推荐）**\n```c\nint init(void) {\n    int *buf1 = NULL, *buf2 = NULL;\n    int ret = -1;\n    buf1 = malloc(1024);\n    if (!buf1) goto cleanup;\n    buf2 = malloc(2048);\n    if (!buf2) goto cleanup;\n    ret = 0;\ncleanup:\n    free(buf2);\n    free(buf1);\n    return ret;\n}\n```\n`goto` 用于错误清理是C语言中广泛接受的例外。\n\n**最佳实践：** 永远检查返回值，用 `goto cleanup` 处理多资源释放，用 `perror` 提供错误信息。'))
+data.append(make_entry('volatile关键字是做什么用的？', None, None, None, '`volatile` 告诉编译器：**这个变量可能被程序外部改变，不要优化它。**\n\n**没有volatile的问题：**\n```c\nint flag = 0;\nwhile (flag == 0) { }  // 编译器可能优化为死循环\n```\n\n**加上volatile：**\n```c\nvolatile int flag = 0;\nwhile (flag == 0) { }  // 每次都从内存重新读取\n```\n\n**三大使用场景：** 硬件寄存器映射、信号处理、多线程共享（简单场景）\n\n**注意：** `volatile` 只保证每次从内存读取，**不保证原子性**，不能替代锁。'))
+data.append(make_entry('如何写一个Makefile？', None, None, None, '```makefile\nCC = gcc\nCFLAGS = -Wall -Wextra -std=c11 -g\n\nSRCS = main.c math_utils.c string_utils.c\nOBJS = $(SRCS:.c=.o)\nTARGET = myprogram\n\n$(TARGET): $(OBJS)\n\t$(CC) $(CFLAGS) -o $@ $^\n\n%.o: %.c\n\t$(CC) $(CFLAGS) -c -o $@ $<\n\nclean:\n\trm -f $(OBJS) $(TARGET)\n\n.PHONY: clean\n```\n\n**要点：**\n1. 目标:依赖，下一行Tab缩进命令\n2. `$@` = 目标名，`$<` = 第一个依赖，`$^` = 所有依赖\n3. `.PHONY` 声明伪目标\n4. 变量替换 `$(SRCS:.c=.o)` 批量改后缀\n5. 模式规则 `%.o: %.c` 通用编译规则'))
+data.append(make_entry('如何用GDB调试程序？', None, None, None, '**编译时加 -g：** `gcc -g -Wall program.c -o program`\n\n**基本流程：**\n```bash\ngdb ./program\nbreak main       # 在main设断点\nbreak 42         # 在第42行设断点\nrun              # 运行\nnext             # 单步（不进入函数）\nstep             # 单步（进入函数）\nprint var        # 打印变量\ncontinue         # 继续运行\nbacktrace        # 打印调用栈\nquit\n```\n\n**调试段错误：**\n```bash\ngdb ./program\nrun              # 运行到崩溃\nbacktrace        # 查看崩溃时的调用栈\nframe 2          # 切到第2帧\nprint *ptr       # 查看指针指向的值\n```\n\n**高级：** `watch var` 监视变量变化；`set var x=5` 修改变量；`x/10x arr` 查看内存。'))
+data.append(make_entry('C语言中如何正确使用const？', None, None, None, '`const` 修饰离它最近的类型，从右往左读：\n\n```c\nconst int x = 10;        // x不可修改\nint const y = 20;        // 同上\nconst int *p;            // *p不可修改（指向const int的指针）\nint *const p = &x;       // p不可修改（const指针指向int）\nconst int *const p = &x; // 都不可修改\n```\n\n**函数参数中使用const：**\n```c\nvoid print_array(const int *arr, int n);  // 承诺不修改数组\nchar *my_strcpy(char *dst, const char *src);  // 不修改src\n```\n\n**好处：** 编译器检查意外修改；向调用者传达意图；允许传const和非const参数。\n\n**注意：** `const` 不等于不可变，通过非const指针仍可修改底层对象。'))
+data.append(make_entry('如何写好C语言的注释？', None, None, None, '**注释原则：解释为什么，而非是什么。**\n\n**不好的注释：**\n```c\ni++;  // i加1\n```\n\n**好的注释：**\n```c\ni++;  // 跳过头部标记字节\n```\n\n**文件头注释：**\n```c\n/* file: queue.c\n * 线程安全的循环队列实现\n * 作者: xxx, 日期: 2024-01 */\n```\n\n**函数注释：**\n```c\n/* 在有序数组中二分查找target\n * 返回索引，未找到返回-1\n * arr必须已升序排列 */\nint binary_search(const int *arr, int n, int target);\n```\n\n**不要注释的：** 代码本身能表达的；过时的注释比没注释更危险；注释不能弥补糟糕的命名。'))
+data.append(make_entry('typedef和#define定义类型别名有什么区别？', 'typedef char *StrPtr1;\n#define StrPtr2 char *\nStrPtr1 a, b;\nStrPtr2 c, d;', None, None, '关键区别：\n```c\nStrPtr1 a, b;   // a和b都是 char*\nStrPtr2 c, d;   // 展开为 char *c, d; → c是char*，d是char！\n```\n\n`#define` 只是文本替换，多变量声明时出问题。\n\n**推荐：** 给类型起别名**永远用 `typedef`**，更安全、更符合C语言语义。`#define` 只在需要文本替换能力时使用。'))
+data.append(make_entry('C语言中enum和宏定义常量相比有什么优缺点？', '#define RED   0\n#define GREEN 1\n#define BLUE  2', None, None, '**enum的优势：**\n1. **类型检查**：函数参数可声明为 `enum Color`，编译器会检查\n2. **调试友好**：GDB显示 `RED` 而非 `0`\n3. **自动编号**：新增值时自动递增\n4. **switch检查**：编译器可检查是否覆盖所有枚举值\n\n**宏的优势：**\n1. **条件编译**：`#ifdef RED`\n2. **非整数值**：`#define PI 3.14`\n3. **泛型代码生成**\n\n**推荐：** 需要一组相关常量时优先用enum，需要条件编译或非整数值时用宏。\n\n```c\ntypedef enum { RED, GREEN, BLUE } Color;\nColor c = RED;  // 有类型，比 #define RED 0 更安全\n```'))
+data.append(make_entry('如何正确使用assert？什么时候用assert，什么时候用错误处理？', None, None, None, '**选择原则：**\n- **assert**：前置条件/不变量（调用者违反了约定，是bug）\n- **错误处理**：外部输入不可控（用户输入/文件/网络）\n\n```c\nint binary_search(int *arr, int n, int target) {\n    assert(arr != NULL);   // 调用者不应传NULL，是bug → assert\n    assert(n >= 0);\n    // ...\n}\n\nFILE *open_config(const char *path) {\n    FILE *fp = fopen(path, "r");\n    if (!fp) {\n        // 文件可能不存在，不是bug → 错误处理\n        perror("fopen");\n        return NULL;\n    }\n    return fp;\n}\n```\n\n**注意：** assert中不要有副作用，Release下会被移除。C11静态断言：`_Static_assert(sizeof(int)==4, "int must be 4 bytes");`'))
+data.append(make_entry('如何处理命令行参数？', None, None, None, '```c\n#include <stdio.h>\n#include <string.h>\n\nint main(int argc, char *argv[]) {\n    const char *output = "default.txt";\n    int verbose = 0;\n    \n    for (int i = 1; i < argc; i++) {\n        if (strcmp(argv[i], "-h") == 0) {\n            printf("Usage: %s [-h] [-o file] [-v]\\n", argv[0]);\n            return 0;\n        } else if (strcmp(argv[i], "-o") == 0) {\n            if (i + 1 >= argc) {\n                fprintf(stderr, "-o needs argument\\n");\n                return 1;\n            }\n            output = argv[++i];\n        } else if (strcmp(argv[i], "-v") == 0) {\n            verbose = 1;\n        }\n    }\n    return 0;\n}\n```\n\n- `argc`：参数个数（含程序名），`argv[0]`：程序名\n- 带参数的选项（如 `-o file`）要检查 `i+1 < argc`\n- POSIX系统可用 `getopt()` 更规范地解析'))
+data.append(make_entry('如何实现回调函数？', None, None, None, '回调函数通过函数指针实现，核心模式是**带 `void *user_data` 的回调**：\n\n```c\ntypedef void (*Callback)(const char *event, void *user_data);\n\ntypedef struct {\n    Callback on_event;\n    void *user_data;\n} EventEmitter;\n\nvoid emitter_trigger(EventEmitter *em, const char *event) {\n    if (em->on_event) em->on_event(event, em->user_data);\n}\n\n// 使用\nvoid log_event(const char *event, void *user_data) {\n    printf("%s\\n", event);\n}\n\nint main(void) {\n    EventEmitter em = {log_event, NULL};\n    emitter_trigger(&em, "startup");\n    return 0;\n}\n```\n\n`void *user_data` 是C回调的标准设计，传递任意上下文，避免全局变量。\n\n**典型场景：** `qsort`比较函数、事件驱动、定时器回调、插件系统。'))
+data.append(make_entry('C语言中如何实现简单的面向对象？封装、继承和多态', None, None, None, 'C语言可通过结构体+函数指针模拟OOP：\n\n**封装：** 结构体+操作函数，用 `const` 限制修改\n```c\ntypedef struct { int x, y; } Point;\nPoint point_new(int x, int y) { return (Point){x, y}; }\ndouble point_dist(const Point *a, const Point *b) { ... }\n```\n\n**继承（结构体嵌套）：**\n```c\ntypedef struct { char name[32]; int age; } Person;\ntypedef struct { Person base; float gpa; } Student;\nStudent s;\nPerson *p = (Person *)&s;  // 安全：base是第一个成员\n```\n\n**多态（虚函数表）：**\n```c\ntypedef struct { double (*area)(const void *self); } ShapeVTable;\ntypedef struct { const ShapeVTable *vtable; } Shape;\ndouble shape_area(const Shape *s) { return s->vtable->area(s); }\n```\n\n这种模式在Linux内核（file_operations）和GObject中广泛使用。'))
+data.append(make_entry('C语言中如何正确使用union？和struct有什么区别？', None, None, None, '**核心区别：** `struct` 成员各自占独立内存，`union` 所有成员共享同一块内存（大小=最大成员）。\n\n**最常见用法：类型标签（Tagged Union）**\n```c\ntypedef enum { INT_VAL, FLOAT_VAL } ValueType;\ntypedef struct {\n    ValueType tag;\n    union {\n        int int_val;\n        double float_val;\n    } data;\n} Value;\n\nvoid print_value(const Value *v) {\n    switch (v->tag) {\n        case INT_VAL:   printf("%d\\n", v->data.int_val); break;\n        case FLOAT_VAL: printf("%f\\n", v->data.float_val); break;\n    }\n}\n```\n\n**注意：** 写入一个成员后读另一个是实现定义行为。`tag` 字段用来跟踪当前活跃成员。'))
+data.append(make_entry('如何用位操作设置、清除、切换标志位？', None, None, None, '```c\nunsigned int flags = 0;\nflags |= (1U << n);    // 设置第n位\nflags &= ~(1U << n);   // 清除第n位\nflags ^= (1U << n);    // 切换第n位\nif (flags & (1U << n)) // 检查第n位\n```\n\n**权限标志示例：**\n```c\n#define PERM_READ   (1U << 0)\n#define PERM_WRITE  (1U << 1)\n#define PERM_EXEC   (1U << 2)\nunsigned int perm = PERM_READ | PERM_EXEC;\nperm &= ~PERM_EXEC;      // 移除执行权限\nif (perm & PERM_READ) {}  // 检查读权限\n```\n\n**常用技巧：** 判断2的幂：`n != 0 && (n & (n-1)) == 0`'))
+data.append(make_entry('如何用C语言实现一个动态数组？类似C++的vector', None, None, None, '```c\n#include <stdio.h>\n#include <stdlib.h>\n\ntypedef struct {\n    int *data;\n    size_t size;\n    size_t capacity;\n} Vec;\n\nVec vec_new(void) {\n    Vec v;\n    v.data = malloc(4 * sizeof(int));\n    v.size = 0;\n    v.capacity = 4;\n    return v;\n}\n\nvoid vec_push(Vec *v, int value) {\n    if (v->size == v->capacity) {\n        v->capacity *= 2;\n        int *tmp = realloc(v->data, v->capacity * sizeof(int));\n        if (!tmp) { fprintf(stderr, "OOM\\n"); exit(1); }\n        v->data = tmp;\n    }\n    v->data[v->size++] = value;\n}\n\nvoid vec_free(Vec *v) {\n    free(v->data);\n    v->data = NULL;\n    v->size = v->capacity = 0;\n}\n```\n\n**关键设计：** 扩容翻倍→均摊O(1)；`realloc`用临时指针接收→防失败丢失原指针；初始容量4→避免频繁扩容。'))
+data.append(make_entry('如何实现一个单链表？', None, None, None, '```c\n#include <stdio.h>\n#include <stdlib.h>\n\ntypedef struct Node {\n    int data;\n    struct Node *next;\n} Node;\n\nNode *list_prepend(Node *head, int data) {\n    Node *n = malloc(sizeof(Node));\n    n->data = data;\n    n->next = head;\n    return n;\n}\n\nNode *list_append(Node *head, int data) {\n    Node *n = malloc(sizeof(Node));\n    n->data = data;\n    n->next = NULL;\n    if (!head) return n;\n    Node *cur = head;\n    while (cur->next) cur = cur->next;\n    cur->next = n;\n    return head;\n}\n\nNode *list_remove(Node *head, int target) {\n    if (!head) return NULL;\n    if (head->data == target) {\n        Node *tmp = head->next;\n        free(head);\n        return tmp;\n    }\n    Node *cur = head;\n    while (cur->next && cur->next->data != target)\n        cur = cur->next;\n    if (cur->next) {\n        Node *tmp = cur->next;\n        cur->next = tmp->next;\n        free(tmp);\n    }\n    return head;\n}\n\nvoid list_free(Node *head) {\n    while (head) {\n        Node *tmp = head->next;\n        free(head);\n        head = tmp;\n    }\n}\n```\n\n**要点：** 头插/删需返回新头指针；`list_free` 先保存 `next` 再 `free`；所有操作处理 `head == NULL`。'))
+data.append(make_entry('如何用栈检查括号匹配？', None, None, None, "```c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct { char *data; int top; int cap; } Stack;\nStack stack_new(int cap) {\n    Stack s; s.data = malloc(cap); s.top = -1; s.cap = cap; return s;\n}\nvoid stack_push(Stack *s, char c) { s->data[++s->top] = c; }\nchar stack_pop(Stack *s) { return s->data[s->top--]; }\nint stack_empty(Stack *s) { return s->top < 0; }\nchar stack_peek(Stack *s) { return s->data[s->top]; }\n\nint is_match(char a, char b) {\n    return (a=='('&&b==')') || (a=='['&&b==']') || (a=='{'&&b=='}');\n}\n\nint check(const char *s) {\n    Stack st = stack_new(strlen(s));\n    for (int i = 0; s[i]; i++) {\n        if (s[i]=='('||s[i]=='['||s[i]=='{') stack_push(&st, s[i]);\n        else if (s[i]==')'||s[i]==']'||s[i]=='}') {\n            if (stack_empty(&st) || !is_match(stack_peek(&st), s[i])) return 0;\n            stack_pop(&st);\n        }\n    }\n    return stack_empty(&st);\n}\n```\n\n**算法：** 左括号入栈，右括号检查栈顶是否匹配。三种不匹配：右括号与栈顶不配、栈空遇右括号、结束后栈非空。"))
+data.append(make_entry('如何实现一个简单的哈希表？', None, None, None, '```c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n#define TABLE_SIZE 64\n\ntypedef struct Entry {\n    char *key;\n    int value;\n    struct Entry *next;\n} Entry;\n\ntypedef struct { Entry *buckets[TABLE_SIZE]; } HashTable;\n\nunsigned long hash(const char *s) {\n    unsigned long h = 5381;\n    while (*s) h = h * 33 + *s++;\n    return h % TABLE_SIZE;\n}\n\nHashTable *ht_new(void) { return calloc(1, sizeof(HashTable)); }\n\nvoid ht_set(HashTable *ht, const char *key, int val) {\n    unsigned long idx = hash(key);\n    Entry *e = ht->buckets[idx];\n    while (e) {\n        if (strcmp(e->key, key) == 0) { e->value = val; return; }\n        e = e->next;\n    }\n    Entry *n = malloc(sizeof(Entry));\n    n->key = strdup(key);\n    n->value = val;\n    n->next = ht->buckets[idx];\n    ht->buckets[idx] = n;\n}\n\nint ht_get(HashTable *ht, const char *key, int *out) {\n    Entry *e = ht->buckets[hash(key)];\n    while (e) {\n        if (strcmp(e->key, key) == 0) { *out = e->value; return 1; }\n        e = e->next;\n    }\n    return 0;\n}\n```\n\n**设计：** djb2哈希 + 链地址法。`ht_get` 返回bool区分"key不存在"和"值为0"。'))
+data.append(make_entry('如何实现冒泡排序？', None, None, None, '```c\nvoid bubble_sort(int arr[], int n) {\n    for (int i = 0; i < n - 1; i++) {\n        int swapped = 0;\n        for (int j = 0; j < n - 1 - i; j++) {\n            if (arr[j] > arr[j + 1]) {\n                int tmp = arr[j]; arr[j] = arr[j+1]; arr[j+1] = tmp;\n                swapped = 1;\n            }\n        }\n        if (!swapped) break;\n    }\n}\n```\n\n**要点：** `swapped` 优化——某轮无交换则提前终止；时间O(n²)，最好O(n)（已有序）；空间O(1)。实际项目优先用 `qsort`。'))
+data.append(make_entry('如何实现快速排序？', None, None, None, '```c\nvoid swap(int *a, int *b) { int t = *a; *a = *b; *b = t; }\n\nint partition(int arr[], int low, int high) {\n    int pivot = arr[high];\n    int i = low;\n    for (int j = low; j < high; j++)\n        if (arr[j] <= pivot) swap(&arr[i++], &arr[j]);\n    swap(&arr[i], &arr[high]);\n    return i;\n}\n\nvoid quick_sort(int arr[], int low, int high) {\n    if (low < high) {\n        int pi = partition(arr, low, high);\n        quick_sort(arr, low, pi - 1);\n        quick_sort(arr, pi + 1, high);\n    }\n}\n```\n\n**要点：** 选最后一个元素为pivot；平均O(n log n)，最坏O(n²)；实际项目用 `qsort`。'))
+data.append(make_entry('斐波那契数列递归和迭代哪个好？', None, None, None, '**递归（不推荐）：** `fib(n-1) + fib(n-2)` → O(2^n)，大量重复计算\n\n**迭代（推荐）：**\n```c\nint fib(int n) {\n    if (n <= 1) return n;\n    int a = 0, b = 1;\n    for (int i = 2; i <= n; i++) {\n        int tmp = a + b;\n        a = b;\n        b = tmp;\n    }\n    return b;  // O(n), O(1)空间\n}\n```\n\n**记忆化递归：** 用数组缓存已计算值，O(n)。\n\n**结论：** 简单线性问题优先用迭代，递归适合分治（快排、归并排序）。'))
+data.append(make_entry('如何实现归并排序？', None, None, None, '```c\n#include <stdlib.h>\n#include <string.h>\n\nvoid merge(int arr[], int l, int m, int r) {\n    int n1 = m - l + 1, n2 = r - m;\n    int *L = malloc(n1 * sizeof(int)), *R = malloc(n2 * sizeof(int));\n    memcpy(L, arr + l, n1 * sizeof(int));\n    memcpy(R, arr + m + 1, n2 * sizeof(int));\n    int i = 0, j = 0, k = l;\n    while (i < n1 && j < n2)\n        arr[k++] = L[i] <= R[j] ? L[i++] : R[j++];\n    while (i < n1) arr[k++] = L[i++];\n    while (j < n2) arr[k++] = R[j++];\n    free(L); free(R);\n}\n\nvoid merge_sort(int arr[], int l, int r) {\n    if (l < r) {\n        int m = l + (r - l) / 2;\n        merge_sort(arr, l, m);\n        merge_sort(arr, m + 1, r);\n        merge(arr, l, m, r);\n    }\n}\n```\n\n**要点：** 稳定排序；时间O(n log n)，空间O(n)；适合链表排序和外部排序。'))
+data.append(make_entry('如何实现二叉搜索树（BST）？', None, None, None, '```c\n#include <stdlib.h>\n\ntypedef struct Node {\n    int val;\n    struct Node *left, *right;\n} Node;\n\nNode *bst_insert(Node *root, int val) {\n    if (!root) {\n        Node *n = calloc(1, sizeof(Node));\n        n->val = val;\n        return n;\n    }\n    if (val < root->val) root->left = bst_insert(root->left, val);\n    else if (val > root->val) root->right = bst_insert(root->right, val);\n    return root;\n}\n\nNode *bst_search(Node *root, int val) {\n    if (!root || root->val == val) return root;\n    return val < root->val ? bst_search(root->left, val) : bst_search(root->right, val);\n}\n\nNode *bst_min(Node *root) {\n    while (root && root->left) root = root->left;\n    return root;\n}\n\nNode *bst_delete(Node *root, int val) {\n    if (!root) return NULL;\n    if (val < root->val) root->left = bst_delete(root->left, val);\n    else if (val > root->val) root->right = bst_delete(root->right, val);\n    else {\n        if (!root->left) { Node *r = root->right; free(root); return r; }\n        if (!root->right) { Node *r = root->left; free(root); return r; }\n        Node *succ = bst_min(root->right);\n        root->val = succ->val;\n        root->right = bst_delete(root->right, succ->val);\n    }\n    return root;\n}\n```\n\n**要点：** 左<根<右；查找/插入平均O(log n)；删除两子节点用后继替换；中序遍历得有序序列。'))
+data.append(make_entry('如何实现二叉树的遍历？', None, None, None, '```c\ntypedef struct TreeNode {\n    int val;\n    struct TreeNode *left, *right;\n} TreeNode;\n\nvoid preorder(TreeNode *root) {\n    if (!root) return;\n    printf("%d ", root->val);\n    preorder(root->left);\n    preorder(root->right);\n}\n\nvoid inorder(TreeNode *root) {\n    if (!root) return;\n    inorder(root->left);\n    printf("%d ", root->val);\n    inorder(root->right);\n}\n\nvoid postorder(TreeNode *root) {\n    if (!root) return;\n    postorder(root->left);\n    postorder(root->right);\n    printf("%d ", root->val);\n}\n```\n\n**要点：**\n1. 前序（根-左-右）：复制树、序列化\n2. 中序（左-根-右）：BST中序遍历得有序序列\n3. 后序（左-右-根）：释放树（先释放子树再释放根）\n4. 时间O(n)，空间O(h)（h为树高）'))
+data.append(make_entry('如何实现一个简单的队列？', None, None, None, '```c\n#include <stdlib.h>\n\ntypedef struct Node { int data; struct Node *next; } Node;\n\ntypedef struct {\n    Node *head;\n    Node *tail;\n    int size;\n} Queue;\n\nQueue queue_new(void) { return (Queue){NULL, NULL, 0}; }\n\nvoid queue_push(Queue *q, int val) {\n    Node *n = malloc(sizeof(Node));\n    n->data = val;\n    n->next = NULL;\n    if (q->tail) q->tail->next = n;\n    else q->head = n;\n    q->tail = n;\n    q->size++;\n}\n\nint queue_pop(Queue *q) {\n    if (!q->head) return -1;\n    Node *tmp = q->head;\n    int val = tmp->data;\n    q->head = tmp->next;\n    if (!q->head) q->tail = NULL;\n    free(tmp);\n    q->size--;\n    return val;\n}\n\nint queue_empty(Queue *q) { return q->size == 0; }\n```\n\n**设计要点：** 维护 `head` 和 `tail`，入队出队均O(1)；队列为空时 `tail` 也要置NULL。'))
+data.append(make_entry('如何实现通用排序函数，能排序任意类型？', None, None, None, '用 `void*` + 函数指针 + 元素大小：\n\n```c\n#include <string.h>\n\nvoid swap_generic(void *a, void *b, size_t size) {\n    char tmp[256];\n    if (size > sizeof(tmp)) return;\n    memcpy(tmp, a, size);\n    memcpy(a, b, size);\n    memcpy(b, tmp, size);\n}\n\nvoid my_qsort(void *base, size_t n, size_t size,\n              int (*cmp)(const void *, const void *)) {\n    if (n <= 1) return;\n    char *arr = base;\n    char *pivot = arr + (n-1) * size;\n    size_t i = 0;\n    for (size_t j = 0; j < n-1; j++)\n        if (cmp(arr + j*size, pivot) <= 0)\n            swap_generic(arr + i*size, arr + j*size, size), i++;\n    swap_generic(arr + i*size, pivot, size);\n    my_qsort(arr, i, size, cmp);\n    my_qsort(arr + (i+1)*size, n-i-1, size, cmp);\n}\n```\n\n**关键技术：** `(char *)base + i * size` 计算第i个元素地址；`memcpy` 代替赋值；比较函数指针由调用者提供。比较函数不要用减法，可能溢出。'))
+data.append(make_entry('如何实现一个简单的内存池？频繁分配释放小对象效率低', None, None, None, '```c\n#include <stdlib.h>\n#include <stdint.h>\n\ntypedef struct {\n    uint8_t *buffer;\n    size_t block_size;\n    size_t free_count;\n    void *free_list;\n} MemPool;\n\nMemPool pool_create(size_t block_size, size_t count) {\n    MemPool p;\n    p.block_size = block_size < sizeof(void*) ? sizeof(void*) : block_size;\n    p.free_count = count;\n    p.buffer = malloc(p.block_size * count);\n    p.free_list = p.buffer;\n    uint8_t *blk = p.buffer;\n    for (size_t i = 0; i < count - 1; i++) {\n        *(void**)blk = blk + p.block_size;\n        blk += p.block_size;\n    }\n    *(void**)blk = NULL;\n    return p;\n}\n\nvoid *pool_alloc(MemPool *p) {\n    if (!p->free_count) return NULL;\n    void *blk = p->free_list;\n    p->free_list = *(void**)blk;\n    p->free_count--;\n    return blk;\n}\n\nvoid pool_free(MemPool *p, void *blk) {\n    *(void**)blk = p->free_list;\n    p->free_list = blk;\n    p->free_count++;\n}\n```\n\n**原理：** 预分配连续内存，空闲块用内置链表串起来。分配O(1)，释放O(1)。适用于频繁创建/销毁相同类型对象。'))
+data.append(make_entry('如何实现插入排序？', None, None, None, '```c\nvoid insertion_sort(int arr[], int n) {\n    for (int i = 1; i < n; i++) {\n        int key = arr[i];\n        int j = i - 1;\n        while (j >= 0 && arr[j] > key) {\n            arr[j + 1] = arr[j];\n            j--;\n        }\n        arr[j + 1] = key;\n    }\n}\n```\n\n**要点：** 稳定排序；时间O(n²)，最好O(n)（已有序）；空间O(1)；小数据量或近乎有序时比快排更快；常作为快排/归并排序的子过程（小区间切换到插入排序）。'))
+data.append(make_entry('如何实现选择排序？', None, None, None, '```c\nvoid selection_sort(int arr[], int n) {\n    for (int i = 0; i < n - 1; i++) {\n        int min_idx = i;\n        for (int j = i + 1; j < n; j++)\n            if (arr[j] < arr[min_idx]) min_idx = j;\n        if (min_idx != i) {\n            int tmp = arr[i]; arr[i] = arr[min_idx]; arr[min_idx] = tmp;\n        }\n    }\n}\n```\n\n**要点：** 不稳定排序（交换可能改变相等元素顺序）；时间O(n²)，空间O(1)；交换次数最少（最多n-1次）；适合交换代价大的场景。'))
+data.append(make_entry('如何实现图的DFS和BFS遍历？', None, None, None, '```c\n#define MAX_V 100\n\ntypedef struct { int adj[MAX_V][MAX_V]; int v; } Graph;\n\nint visited[MAX_V];\n\nvoid dfs(Graph *g, int start) {\n    visited[start] = 1;\n    printf("%d ", start);\n    for (int i = 0; i < g->v; i++)\n        if (g->adj[start][i] && !visited[i])\n            dfs(g, i);\n}\n\nvoid bfs(Graph *g, int start) {\n    int queue[MAX_V], front = 0, rear = 0;\n    int vis[MAX_V] = {0};\n    queue[rear++] = start;\n    vis[start] = 1;\n    while (front < rear) {\n        int cur = queue[front++];\n        printf("%d ", cur);\n        for (int i = 0; i < g->v; i++)\n            if (g->adj[cur][i] && !vis[i]) {\n                queue[rear++] = i;\n                vis[i] = 1;\n            }\n    }\n}\n```\n\n**DFS：** 栈/递归，适合路径搜索、连通性检测。**BFS：** 队列，适合最短路径（无权图）、层序遍历。'))
+data.append(make_entry('如何实现0-1背包问题（动态规划）？', None, None, None, '```c\nint knapsack(int W, int wt[], int val[], int n) {\n    int dp[n + 1][W + 1];\n    for (int i = 0; i <= n; i++)\n        for (int w = 0; w <= W; w++) {\n            if (i == 0 || w == 0) dp[i][w] = 0;\n            else if (wt[i-1] <= w)\n                dp[i][w] = val[i-1] + dp[i-1][w - wt[i-1]] > dp[i-1][w]\n                           ? val[i-1] + dp[i-1][w - wt[i-1]] : dp[i-1][w];\n            else dp[i][w] = dp[i-1][w];\n        }\n    return dp[n][W];\n}\n```\n\n**状态转移：** `dp[i][w]` = 前i个物品、容量w时的最大价值\n- 不选物品i：`dp[i-1][w]`\n- 选物品i：`val[i-1] + dp[i-1][w-wt[i-1]]`\n\n**空间优化：** 用一维数组逆序遍历：`dp[w] = max(dp[w], val[i]+dp[w-wt[i]])`，O(W)空间。'))
+data.append(make_entry('如何实现最长公共子序列（LCS）？', None, None, None, '```c\n#include <string.h>\n\nint lcs(const char *s1, const char *s2) {\n    int m = strlen(s1), n = strlen(s2);\n    int dp[m + 1][n + 1];\n    for (int i = 0; i <= m; i++)\n        for (int j = 0; j <= n; j++) {\n            if (i == 0 || j == 0) dp[i][j] = 0;\n            else if (s1[i-1] == s2[j-1]) dp[i][j] = dp[i-1][j-1] + 1;\n            else dp[i][j] = dp[i-1][j] > dp[i][j-1] ? dp[i-1][j] : dp[i][j-1];\n        }\n    return dp[m][n];\n}\n```\n\n**状态转移：** 字符相同→`dp[i-1][j-1]+1`；不同→`max(dp[i-1][j], dp[i][j-1])`\n\n**回溯路径：** 从 `dp[m][n]` 往回走，相同字符加入结果。时间O(mn)，空间可优化到O(min(m,n))。'))
+data.append(make_entry('双指针技巧是什么？有哪些典型应用？', None, None, None, '双指针用两个索引/指针协同遍历，将O(n²)降为O(n)：\n\n**1. 对撞指针（有序数组两数之和）**\n```c\nint *two_sum(int *arr, int n, int target) {\n    int left = 0, right = n - 1;\n    static int result[2];\n    while (left < right) {\n        int sum = arr[left] + arr[right];\n        if (sum == target) { result[0]=left; result[1]=right; return result; }\n        else if (sum < target) left++;\n        else right--;\n    }\n    return NULL;\n}\n```\n\n**2. 快慢指针（找链表中点/环检测）**\n```c\nint has_cycle(Node *head) {\n    Node *slow = head, *fast = head;\n    while (fast && fast->next) {\n        slow = slow->next;\n        fast = fast->next->next;\n        if (slow == fast) return 1;\n    }\n    return 0;\n}\n```\n\n**3. 滑动窗口（最长无重复子串）**：右指针扩展，左指针收缩。'))
+data.append(make_entry('如何实现N皇后问题（回溯法）？', None, None, None, '```c\n#include <stdio.h>\n#include <stdlib.h>\n\nint solve_nq(int n) {\n    int *cols = calloc(n, sizeof(int));\n    int count = 0;\n    void backtrack(int row) {\n        if (row == n) { count++; return; }\n        for (int col = 0; col < n; col++) {\n            int ok = 1;\n            for (int r = 0; r < row; r++)\n                if (cols[r] == col || abs(cols[r]-col) == abs(r-row))\n                    { ok = 0; break; }\n            if (ok) { cols[row] = col; backtrack(row + 1); }\n        }\n    }\n    backtrack(0);\n    free(cols);\n    return count;\n}\n```\n\n**回溯三步：** 选择→递归→撤销。冲突检测：同列 `cols[r]==col`；对角线 `|cols[r]-col|==|r-row|`。\n\n**时间：** O(n!)，n=8时92个解。'))
+data.append(make_entry('如何实现二叉树的层序遍历？', None, None, None, '```c\ntypedef struct TreeNode {\n    int val;\n    struct TreeNode *left, *right;\n} TreeNode;\n\nvoid level_order(TreeNode *root) {\n    if (!root) return;\n    TreeNode *queue[1000];\n    int front = 0, rear = 0;\n    queue[rear++] = root;\n    while (front < rear) {\n        TreeNode *node = queue[front++];\n        printf("%d ", node->val);\n        if (node->left) queue[rear++] = node->left;\n        if (node->right) queue[rear++] = node->right;\n    }\n}\n```\n\n**要点：** 用队列实现BFS；时间O(n)，空间O(w)（w为最大宽度）；如需按层分组，在每层开始时记录队列长度。'))
+data.append(make_entry('如何实现堆排序？', None, None, None, '```c\nvoid swap(int *a, int *b) { int t = *a; *a = *b; *b = t; }\n\nvoid heapify(int arr[], int n, int i) {\n    int largest = i;\n    int l = 2*i + 1, r = 2*i + 2;\n    if (l < n && arr[l] > arr[largest]) largest = l;\n    if (r < n && arr[r] > arr[largest]) largest = r;\n    if (largest != i) {\n        swap(&arr[i], &arr[largest]);\n        heapify(arr, n, largest);\n    }\n}\n\nvoid heap_sort(int arr[], int n) {\n    for (int i = n/2 - 1; i >= 0; i--) heapify(arr, n, i);\n    for (int i = n - 1; i > 0; i--) {\n        swap(&arr[0], &arr[i]);\n        heapify(arr, i, 0);\n    }\n}\n```\n\n**要点：** 建堆O(n)；排序O(n log n)；不稳定；空间O(1)；适合找前k大/小元素（部分堆排序）。'))
+data.append(make_entry('如何反转字符串？原地反转', None, None, None, '```c\nvoid str_reverse(char *s) {\n    int left = 0, right = strlen(s) - 1;\n    while (left < right) {\n        char tmp = s[left];\n        s[left] = s[right];\n        s[right] = tmp;\n        left++;\n        right--;\n    }\n}\n```\n\n**要点：** 双指针对撞交换；O(n)时间，O(1)空间；注意 `strlen(s)-1` 是最后一个字符的索引（不含 `\\0`）。'))
+data.append(make_entry('如何实现Dijkstra最短路径算法？', None, None, None, '```c\n#include <limits.h>\n#include <stdbool.h>\n\n#define V 5\n#define INF INT_MAX\n\nint min_dist(int dist[], bool visited[]) {\n    int min = INF, idx = -1;\n    for (int v = 0; v < V; v++)\n        if (!visited[v] && dist[v] <= min) { min = dist[v]; idx = v; }\n    return idx;\n}\n\nvoid dijkstra(int graph[V][V], int src) {\n    int dist[V];\n    bool visited[V] = {false};\n    for (int i = 0; i < V; i++) dist[i] = INF;\n    dist[src] = 0;\n    for (int count = 0; count < V - 1; count++) {\n        int u = min_dist(dist, visited);\n        visited[u] = true;\n        for (int v = 0; v < V; v++)\n            if (!visited[v] && graph[u][v] && dist[u] != INF\n                && dist[u] + graph[u][v] < dist[v])\n                dist[v] = dist[u] + graph[u][v];\n    }\n}\n```\n\n**要点：** 贪心算法，只适用于非负权边；朴素实现O(V²)；用优先队列优化到O(E log V)；不能处理负权边（用Bellman-Ford）。'))
+data.append(make_entry('我的链表删除节点后程序崩溃了，请帮我看看', 'typedef struct Node {\n    int data;\n    struct Node *next;\n} Node;\n\nvoid delete_node(Node *head, int target) {\n    Node *cur = head;\n    while (cur && cur->data != target)\n        cur = cur->next;\n    if (cur) free(cur);\n}', None, '链表删除节点时，必须先将被删除节点的前驱节点的next指针指向后继节点，否则链表断裂。正确步骤：1.找到目标节点及其前驱 2.前驱的next指向目标节点的next 3.释放目标节点。如果删除的是头节点，需要更新头指针。', '根据参考文档，你的代码有两个问题：\n1. **没有修改前驱的next指针**：`free(cur)` 后，前驱节点的 `next` 仍指向已释放的内存（悬垂指针），后续访问崩溃\n2. **没有处理头节点**：如果删除的是头节点，调用者的头指针不会更新\n\n**修复：**\n```c\nNode *delete_node(Node *head, int target) {\n    if (!head) return NULL;\n    if (head->data == target) {\n        Node *tmp = head->next;\n        free(head);\n        return tmp;  // 返回新头\n    }\n    Node *prev = head, *cur = head->next;\n    while (cur && cur->data != target) {\n        prev = cur;\n        cur = cur->next;\n    }\n    if (cur) {\n        prev->next = cur->next;  // 前驱指向后继\n        free(cur);\n    }\n    return head;\n}\n```\n\n**关键步骤：** 前驱next指向后继→释放目标节点→返回头指针。'))
+data.append(make_entry('如何实现字符串查找？我想在一个字符串中找子串', None, None, 'C标准库提供了strstr函数用于查找子串：char *strstr(const char *haystack, const char *needle); 返回第一次出现的位置指针，未找到返回NULL。时间复杂度为O(n*m)，n为haystack长度，m为needle长度。如需更高效率，可使用KMP算法，时间复杂度O(n+m)。', '根据参考文档，最简单的方式是使用标准库 `strstr`：\n```c\n#include <string.h>\nchar *found = strstr(text, pattern);\nif (found) printf("找到，位置：%ld\\n", found - text);\n```\n\n如果需要更高效率（多次查找），可用**KMP算法**：\n```c\nvoid build_lps(const char *pat, int *lps, int m) {\n    int len = 0; lps[0] = 0;\n    int i = 1;\n    while (i < m) {\n        if (pat[i] == pat[len]) lps[i++] = ++len;\n        else if (len) len = lps[len - 1];\n        else lps[i++] = 0;\n    }\n}\n\nint kmp_search(const char *txt, const char *pat) {\n    int n = strlen(txt), m = strlen(pat);\n    int *lps = malloc(m * sizeof(int));\n    build_lps(pat, lps, m);\n    int i = 0, j = 0;\n    while (i < n) {\n        if (txt[i] == pat[j]) { i++; j++; }\n        if (j == m) { free(lps); return i - j; }\n        else if (i < n && txt[i] != pat[j]) {\n            if (j) j = lps[j-1]; else i++;\n        }\n    }\n    free(lps); return -1;\n}\n```\n\n**KMP核心：** LPS数组避免重复比较，O(n+m)时间。'))
+data.append(make_entry('如何正确使用qsort对结构体数组排序？', 'typedef struct {\n    char name[32];\n    int score;\n} Student;\n\nStudent students[100];\n// 如何按score排序？', None, 'qsort函数原型：void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)); 比较函数返回值：负数表示a<b，0表示相等，正数表示a>b。比较函数中不要用减法（可能溢出），应使用条件判断。', '根据参考文档，使用 `qsort` 需要提供比较函数：\n```c\nint cmp_by_score(const void *a, const void *b) {\n    const Student *sa = (const Student *)a;\n    const Student *sb = (const Student *)b;\n    if (sa->score < sb->score) return -1;\n    if (sa->score > sb->score) return 1;\n    return 0;\n}\n\nqsort(students, 100, sizeof(Student), cmp_by_score);\n```\n\n**注意：** 比较函数中**不要用减法** `return sa->score - sb->score`，因为整数溢出会导致排序错误。用条件判断最安全。\n\n**按字符串排序：** `return strcmp(sa->name, sb->name);`'))
+data.append(make_entry('这段代码有什么问题？', 'void process(int *data, int size) {\n    int *copy = malloc(size * sizeof(int));\n    memcpy(copy, data, size);\n    // 使用copy...\n    free(copy);\n}', None, 'memcpy的第三个参数是字节数，不是元素个数。正确用法：memcpy(dest, src, count * sizeof(element))。例如复制int数组：memcpy(copy, data, size * sizeof(int))。', '根据参考文档，`memcpy` 的第三个参数是**字节数**，不是元素个数。你的代码 `memcpy(copy, data, size)` 只复制了 `size` 个字节，而非 `size` 个 `int`。\n\n**修复：**\n```c\nmemcpy(copy, data, size * sizeof(int));\n```\n\n**常见错误模式：**\n```c\nmemcpy(dst, src, n);           // 错误：只复制n字节\nmemcpy(dst, src, n * sizeof(*dst));  // 正确：复制n个元素\n```\n\n**最佳实践：** 用 `sizeof(*dst)` 而非 `sizeof(type)`，与目标指针类型绑定，改类型时自动适配。'))
+data.append(make_entry('如何实现一个简单的引用计数？管理共享资源', None, None, '引用计数是一种内存管理技术：每个对象维护一个计数器，新引用+1，引用释放-1，计数为0时释放对象。常见于COM对象、智能指针等。关键是要保证计数操作的原子性和成对性。', '根据参考文档，引用计数的核心是**成对的增减操作**：\n\n```c\n#include <stdlib.h>\n\ntypedef struct {\n    int ref_count;\n    void (*destroy)(void *);\n    char data[];\n} RefObject;\n\nRefObject *ref_new(size_t data_size, void (*destroy)(void *)) {\n    RefObject *obj = malloc(sizeof(RefObject) + data_size);\n    obj->ref_count = 1;\n    obj->destroy = destroy;\n    return obj;\n}\n\nRefObject *ref_inc(RefObject *obj) {\n    obj->ref_count++;\n    return obj;\n}\n\nvoid ref_dec(RefObject *obj) {\n    if (--obj->ref_count == 0) {\n        if (obj->destroy) obj->destroy(obj->data);\n        free(obj);\n    }\n}\n```\n\n**规则：** 获取引用时 `ref_inc`，不再使用时 `ref_dec`；创建时计数为1；计数归零时释放。\n\n**注意：** 多线程环境下需用原子操作 `__sync_add_and_fetch`/`__sync_sub_and_fetch`。'))
+data.append(make_entry('如何避免头文件重复包含？', None, None, 'C语言使用头文件保护（Include Guard）防止重复包含：#ifndef HEADER_NAME_H / #define HEADER_NAME_H / ... / #endif。部分编译器支持#pragma once，更简洁但非标准。', '根据参考文档，有两种方式：\n\n**1. 传统方式（可移植）：**\n```c\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n\nint my_function(int x);\n\n#endif\n```\n\n**2. #pragma once（简洁但非标准）：**\n```c\n#pragma once\n\nint my_function(int x);\n```\n\n**推荐：** 新项目可用 `#pragma once`，需跨编译器时用传统方式。两者可以同时使用。'))
+data.append(make_entry('如何检测和避免内存泄漏？', None, None, 'Valgrind是Linux下最常用的内存检测工具：valgrind --leak-check=full --show-leak-kinds=all ./program。它会报告：definitely lost（确定泄漏）、indirectly lost（间接泄漏）、possibly lost（可能泄漏）、still reachable（仍可达）。AddressSanitizer是编译器内置方案：gcc -fsanitize=address -g program.c。', '根据参考文档，两种主要检测工具：\n\n**1. Valgrind（无需重编译）**\n```bash\nvalgrind --leak-check=full ./program\n```\n输出中关注 `definitely lost`，这是确定的内存泄漏。\n\n**2. AddressSanitizer（编译时注入）**\n```bash\ngcc -fsanitize=address -g program.c -o program\n./program\n```\n运行时检测，发现泄漏会打印详细堆栈。\n\n**防泄漏编码习惯：**\n1. 每写一个 `malloc`，立刻写配对的 `free`\n2. 遵循"谁分配谁释放"原则\n3. 用 `goto cleanup` 统一释放多资源\n4. 复杂项目考虑引用计数或内存池'))
+data.append(make_entry('这段代码有什么问题？', 'int *find_max(int arr[], int n) {\n    int max_idx = 0;\n    for (int i = 1; i < n; i++)\n        if (arr[i] > arr[max_idx]) max_idx = i;\n    return &arr[max_idx];\n}', None, '返回指向函数参数（数组）元素的指针是安全的，因为数组在调用者作用域内有效。但如果传入的是局部数组的指针，则可能产生悬垂指针。更安全的做法是返回索引而非指针。', '这段代码**如果 `arr` 来自调用者作用域则是安全的**，因为返回的指针指向调用者的内存。\n\n但有一个隐患：如果调用者传入局部数组的指针，且该数组在返回后失效，则指针悬垂。\n\n**更安全的做法：返回索引**\n```c\nint find_max_idx(int arr[], int n) {\n    int max_idx = 0;\n    for (int i = 1; i < n; i++)\n        if (arr[i] > arr[max_idx]) max_idx = i;\n    return max_idx;  // 返回索引，调用者用arr[idx]访问\n}\n```\n\n**原则：** 函数应避免返回指向参数内部数据的指针，返回索引更灵活、更安全。'))
+data.append(make_entry('如何实现一个简单的字符串分割函数？类似strtok但不想修改原字符串', None, None, "strtok函数会修改原字符串（将分隔符替换为'\\0'），且不是线程安全的。strtok_r是可重入版本。如果不想修改原字符串，需要先复制一份，或自己实现不修改原串的版本。", '根据参考文档，`strtok` 会修改原字符串且非线程安全。以下是不修改原串的实现：\n\n```c\ntypedef struct { const char *start; size_t len; } StrSlice;\n\nint str_split(const char *s, char delim, StrSlice *out, int max_out) {\n    int count = 0;\n    const char *p = s;\n    while (*p && count < max_out) {\n        while (*p == delim) p++;\n        if (!*p) break;\n        const char *start = p;\n        while (*p && *p != delim) p++;\n        out[count].start = start;\n        out[count].len = p - start;\n        count++;\n    }\n    return count;\n}\n\n// 使用\nStrSlice parts[16];\nint n = str_split("hello,world,foo", \',\', parts, 16);\nfor (int i = 0; i < n; i++)\n    printf("%.*s\\n", (int)parts[i].len, parts[i].start);\n```\n\n**设计：** 用 `StrSlice` 记录起始位置和长度，不复制字符串；`%.*s` 打印指定长度的子串。'))
+data.append(make_entry('如何实现一个简单的日志系统？', None, None, None, '```c\n#include <stdio.h>\n#include <stdarg.h>\n#include <time.h>\n\ntypedef enum { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR } LogLevel;\n\nstatic LogLevel min_level = LOG_INFO;\n\nvoid log_set_level(LogLevel level) { min_level = level; }\n\nvoid log_msg(LogLevel level, const char *file, int line, const char *fmt, ...) {\n    if (level < min_level) return;\n    const char *names[] = {"DEBUG", "INFO", "WARN", "ERROR"};\n    time_t now = time(NULL);\n    struct tm *t = localtime(&now);\n    char ts[20];\n    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);\n    fprintf(stderr, "[%s] [%s] %s:%d: ", ts, names[level], file, line);\n    va_list ap;\n    va_start(ap, fmt);\n    vfprintf(stderr, fmt, ap);\n    va_end(ap);\n    fprintf(stderr, "\\n");\n}\n\n#define LOG(level, ...) log_msg(level, __FILE__, __LINE__, __VA_ARGS__)\n```\n\n**使用：** `LOG(LOG_INFO, "Processing %d items", count);`\n**输出：** `[2024-01-15 10:30:45] [INFO] main.c:42: Processing 10 items`'))
+data.append(make_entry('C语言中指针和数组到底是什么关系？', None, None, None, '**核心区别：**\n1. 数组是**一块连续内存**，大小在编译时确定（VLA除外）\n2. 指针是**存储地址的变量**，4/8字节\n\n**数组在大多数场景下退化为指针：**\n```c\nint arr[5] = {1,2,3,4,5};\nint *p = arr;       // arr退化为 &arr[0]\narr[i] 等价于 *(arr + i)\n```\n\n**三个不退化的例外：**\n1. `sizeof(arr)` → 返回整个数组大小\n2. `&arr` → 指向数组的指针，类型 `int (*)[5]`\n3. 字符串初始化 `char s[] = "hello"`\n\n**关键理解：** `arr[i]` 本质是 `*(arr + i)`，所以 `arr[i]` 和 `i[arr]` 等价（但别这么写）。函数参数中的 `int arr[]` 就是 `int *arr`。'))
+data.append(make_entry('如何理解C语言的声明？复杂声明怎么看？', None, None, None, '**右左法则（Spiral Rule）：** 从变量名开始，先向右看，再向左看，遇到括号换方向。\n\n**示例：**\n```c\nint *arr[10];        // arr是数组[10]，每个元素是int* → 指针数组\nint (*arr)[10];      // arr是指针，指向int[10] → 数组指针\nint *func(void);     // func是函数，返回int* → 返回指针的函数\nint (*func)(void);   // func是指针，指向 返回int的函数 → 函数指针\nint (*arr[5])(int);  // arr是数组[5]，每个元素是函数指针 → 函数指针数组\n```\n\n**技巧：** 用 `typedef` 简化复杂声明\n```c\ntypedef int (*Comparator)(const void *, const void *);\nComparator callbacks[5];  // 比 int (*callbacks[5])(const void*, const void*) 清晰\n```'))
+data.append(make_entry('这段代码有什么问题？', 'int main(void) {\n    int *ptr;\n    *ptr = 42;\n    printf("%d\\n", *ptr);\n    return 0;\n}', None, None, '**未初始化指针**（野指针）。`ptr` 没有指向任何有效内存，`*ptr = 42` 向随机地址写入，未定义行为。\n\n**修复：**\n```c\nint value;\nint *ptr = &value;  // 指向有效变量\n*ptr = 42;\nprintf("%d\\n", *ptr);  // 输出42\n```\n\n或动态分配：\n```c\nint *ptr = malloc(sizeof(int));\nif (!ptr) return 1;\n*ptr = 42;\nprintf("%d\\n", *ptr);\nfree(ptr);\n```\n\n**规则：** 指针声明后必须初始化——要么指向有效变量，要么指向 `malloc` 返回的内存，要么设为 `NULL`。'))
+data.append(make_entry('C语言中如何实现泛型编程？', None, None, None, 'C语言通过 `void*` + 函数指针 + 元素大小实现泛型：\n\n**1. 泛型容器**\n```c\ntypedef struct { void *data; size_t size; size_t elem_size; size_t capacity; } GenericVec;\n```\n\n**2. 泛型算法（如qsort）**\n```c\nvoid my_sort(void *base, size_t n, size_t elem_size,\n             int (*cmp)(const void *, const void *));\n```\n\n**3. 泛型宏（C11 _Generic）**\n```c\n#define print_val(x) _Generic((x), \\\n    int: printf("%d\\n", x), \\\n    double: printf("%f\\n", x), \\\n    char*: printf("%s\\n", x))\n```\n\n**局限：** `void*` 丢失类型信息，需调用者保证类型正确；没有模板那样的编译期检查；调试困难。\n\n**实际项目：** 标准库的 `qsort`/`bsearch` 是最好的泛型范例。'))
+data.append(make_entry('如何实现一个简单的配置文件解析器？', None, None, '常见的配置文件格式为 key=value，每行一个配置项。#开头的行为注释。解析时需要：跳过空行和注释行、去除key和value两端的空白字符、处理等号分隔。建议使用fgets逐行读取，strtok或手动解析key/value。', '根据参考文档，实现一个简单的 key=value 配置解析器：\n\n```c\n#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n#include <ctype.h>\n\ntypedef struct { char key[64]; char value[256]; } ConfigEntry;\n\nstatic char *trim(char *s) {\n    while (isspace(*s)) s++;\n    char *end = s + strlen(s) - 1;\n    while (end > s && isspace(*end)) *end-- = \'\\0\';\n    return s;\n}\n\nint parse_config(const char *path, ConfigEntry *entries, int max) {\n    FILE *fp = fopen(path, "r");\n    if (!fp) return -1;\n    int count = 0;\n    char line[512];\n    while (fgets(line, sizeof(line), fp) && count < max) {\n        char *p = trim(line);\n        if (*p == \'#\' || *p == \'\\0\') continue;\n        char *eq = strchr(p, \'=\');\n        if (!eq) continue;\n        *eq = \'\\0\';\n        strncpy(entries[count].key, trim(p), 63);\n        strncpy(entries[count].value, trim(eq + 1), 255);\n        count++;\n    }\n    fclose(fp);\n    return count;\n}\n```\n\n**支持格式：** `key = value`、`#注释`、自动去除空白。'))
+with open('fine_tune_train_set_c_programming.json', 'w', encoding='utf-8') as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
-
-print(f"训练集生成完成，共 {len(data)} 条")
+print(f'训练集生成完成，共 {len(data)} 条')
